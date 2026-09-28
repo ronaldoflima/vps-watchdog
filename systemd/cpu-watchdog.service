@@ -1,0 +1,7 @@
+[Unit]
+Description=CPU watchdog - throttle processos com CPU alta sustentada
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cpu-watchdog.sh

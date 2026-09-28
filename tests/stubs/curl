@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+printf '%s\n' "$@" >>"$STUB_DIR/calls/curl.argv"
+[ -t 0 ] || cat >>"$STUB_DIR/calls/curl.stdin"

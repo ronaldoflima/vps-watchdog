@@ -1,0 +1,11 @@
+[Unit]
+Description=Roda cpu-watchdog a cada minuto
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=cpu-watchdog.service
+
+[Install]
+WantedBy=timers.target

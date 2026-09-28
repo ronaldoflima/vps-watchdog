@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+case "$*" in
+    *pcpu*) cat "$STUB_DIR/ps_cpu" ;;
+    *rss*)  cat "$STUB_DIR/ps_mem" ;;
+    *) echo "stub ps: argumentos inesperados: $*" >&2; exit 1 ;;
+esac
