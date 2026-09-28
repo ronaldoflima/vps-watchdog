@@ -89,6 +89,12 @@ MEM_VICTIM_MIN_MB=200
 # [0-9]+[.][0-9]+[.][0-9]+ = binário versionado do Claude Code (ex.: 2.1.283).
 MEM_PREFER_REGEX="^(claude|node|php|php8[.]3|chrome|chrome-devtools|[0-9]+[.][0-9]+[.][0-9]+)$"
 
+# Morrem ANTES dos que casam MEM_PREFER_REGEX: processos descartáveis que os
+# agentes sobem para testar/buildar. Regex ERE contra a LINHA DE COMANDO
+# completa, porque vite/jest aparecem como "node" e phpunit como "php" no comm.
+# Vazio = desativado (só MEM_PREFER_REGEX vale).
+MEM_PREFER_FIRST_REGEX="node_modules/[.]bin/(vite|vitest|jest|webpack|playwright|tsc|esbuild)|vendor/bin/(phpunit|pest|paratest)|artisan (test|dusk)|--headless"
+
 # Nunca mortos pela camada de memória. Diferente da WHITELIST_COMM: "claude"
 # NÃO está aqui (isento de throttle de CPU, mas pode morrer por memória).
 # WHITELIST_CMDLINE também vale aqui.

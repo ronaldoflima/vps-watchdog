@@ -65,6 +65,32 @@ test_system_pressure_kills_one_preferred_process() {
     assert_contains "$(log_content)" "MEM_SYS_HIGH"
 }
 
+test_test_tooling_killed_before_preferred_agent() {
+    EXTRA_CONF='MEM_PREFER_FIRST_REGEX="node_modules/[.]bin/(vite|vitest)|vendor/bin/(phpunit|pest)"' write_conf
+    set_meminfo 8000000 400000 2000000 100000
+    local agent vite
+    agent=$(spawn_victim --session); vite=$(spawn_victim /app/node_modules/.bin/vite)
+    link_proc "$agent" "$vite"
+    ps_mem "$agent" $((900 * MB)) prefer-me
+    ps_mem "$vite" $((300 * MB)) node
+    run_watchdog; run_watchdog
+    assert_dead "$vite"
+    assert_alive "$agent" "(agente só depois das ferramentas de teste)"
+}
+
+test_preferred_agent_still_killed_when_no_test_tooling_left() {
+    EXTRA_CONF='MEM_PREFER_FIRST_REGEX="vendor/bin/phpunit"' write_conf
+    set_meminfo 8000000 400000 2000000 100000
+    local agent other
+    agent=$(spawn_victim --session); other=$(spawn_victim --server)
+    link_proc "$agent" "$other"
+    ps_mem "$agent" $((300 * MB)) prefer-me
+    ps_mem "$other" $((900 * MB)) bigapp
+    run_watchdog; run_watchdog
+    assert_dead "$agent"
+    assert_alive "$other"
+}
+
 test_system_pressure_without_preferred_kills_largest() {
     set_meminfo 8000000 400000 2000000 100000
     local small big
@@ -123,6 +149,8 @@ run_test test_process_below_mem_limit_untouched
 run_test test_mem_whitelist_protects_process
 run_test test_cpu_whitelist_does_not_protect_from_memory_layer
 run_test test_system_pressure_kills_one_preferred_process
+run_test test_test_tooling_killed_before_preferred_agent
+run_test test_preferred_agent_still_killed_when_no_test_tooling_left
 run_test test_system_pressure_without_preferred_kills_largest
 run_test test_low_ram_with_free_swap_does_not_kill
 run_test test_low_ram_warns_once_within_cooldown

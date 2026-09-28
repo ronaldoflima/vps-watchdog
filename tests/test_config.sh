@@ -46,6 +46,11 @@ test_example_config_regexes_compile() {
     if [ -n "$cmdline" ]; then
         is_valid_ere "$cmdline" || fail "WHITELIST_CMDLINE não é ERE válida: $cmdline"
     fi
+    local first; first=$(conf_value "$EXAMPLE_CONF" MEM_PREFER_FIRST_REGEX)
+    is_valid_ere "$first" || fail "MEM_PREFER_FIRST_REGEX não é ERE válida: $first"
+    grep -Eq -- "$first" <<<"node /app/node_modules/.bin/vite" || fail "MEM_PREFER_FIRST_REGEX não casa vite"
+    grep -Eq -- "$first" <<<"php vendor/bin/phpunit --filter X" || fail "MEM_PREFER_FIRST_REGEX não casa phpunit"
+    ! grep -Eq -- "$first" <<<"/home/u/.local/bin/claude --resume" || fail "MEM_PREFER_FIRST_REGEX casa claude"
 }
 
 test_earlyoom_args_are_well_formed() {
@@ -65,6 +70,11 @@ test_earlyoom_args_are_well_formed() {
         esac
     done
     [[ "$EARLYOOM_ARGS" == *--avoid* ]] || fail "--avoid ausente"
+    local prefer; prefer=$(grep -oE -- "--prefer '[^']+'" <<<"$EARLYOOM_ARGS" | cut -d"'" -f2)
+    grep -Eq -- "$prefer" <<<"node" || fail "--prefer não mira node (vite, jest...)"
+    grep -Eq -- "$prefer" <<<"php" || fail "--prefer não mira php (phpunit)"
+    ! grep -Eq -- "$prefer" <<<"claude" || fail "--prefer não deve mirar claude (ferramentas de teste antes)"
+    ! grep -Eq -- "$prefer" <<<"2.1.283" || fail "--prefer não deve mirar o binário versionado do Claude Code"
     local avoid; avoid=$(grep -oE -- "--avoid '[^']+'" <<<"$EARLYOOM_ARGS" | cut -d"'" -f2)
     local proc
     for proc in sshd systemd earlyoom; do

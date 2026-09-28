@@ -6,7 +6,9 @@
 # máquina em vez dos processos que estavam inflando a memória (dezenas de
 # sessões claude/node/php).
 #
-# --prefer: quem costuma inflar (sessões Claude Code, node, php/phpunit).
+# --prefer: node/php/chrome — onde rodam vite, jest, phpunit e browsers
+#           headless que os agentes sobem para testar. As sessões Claude Code
+#           ficam de fora de propósito: só morrem depois, pelo tamanho.
 # --avoid:  acesso remoto, init, runtime de containers e bancos.
 # Os kills são relatados no Telegram pelo cpu-watchdog (Camada 4c).
-EARLYOOM_ARGS="-m 6,3 -s 10,5 -r 3600 --prefer '^(claude|node|php|php8[.]3|chrome|chrome-devtools|[0-9]+[.][0-9]+[.][0-9]+)$' --avoid '^(sshd|systemd|systemd-.*|init|dbus-daemon|dockerd|containerd|containerd-shim|postgres|qdrant|tailscaled|earlyoom|cpulimit)$'"
+EARLYOOM_ARGS="-m 6,3 -s 10,5 -r 3600 --prefer '^(node|php|php8[.]3|chrome|chrome-devtools)$' --avoid '^(sshd|systemd|systemd-.*|init|dbus-daemon|dockerd|containerd|containerd-shim|postgres|qdrant|tailscaled|earlyoom|cpulimit)$'"

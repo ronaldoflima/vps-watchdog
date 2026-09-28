@@ -11,7 +11,6 @@ STUBS_DIR="$REPO_DIR/tests/stubs"
 TESTS_RUN=0
 TESTS_FAILED=0
 CURRENT_TEST=""
-VICTIMS=()
 
 fail() {
     local msg="$*"
@@ -54,7 +53,7 @@ assert_dead() {
 spawn_victim() {
     bash -c 'while :; do sleep 1; done' victim "$@" >/dev/null 2>&1 &
     local pid=$!
-    VICTIMS+=("$pid")
+    echo "$pid" >>"$T/victims"
     for _ in $(seq 1 50); do
         [ -s "/proc/$pid/cmdline" ] && break
         sleep 0.02
@@ -67,6 +66,7 @@ setup_env() {
     mkdir -p "$T/state" "$T/proc/pressure" "$T/calls"
     : >"$T/ps_cpu"
     : >"$T/ps_mem"
+    : >"$T/victims"
     set_meminfo 8000000 4000000 2000000 1800000
     echo "some avg10=0.00 avg60=0.00 avg300=0.00 total=0" >"$T/proc/pressure/memory"
     write_conf
@@ -137,11 +137,12 @@ log_content() { cat "$T/watchdog.log" 2>/dev/null || true; }
 calls() { cat "$T/calls/$1" 2>/dev/null || true; }
 
 teardown_env() {
+    # Arquivo, não array: spawn_victim roda dentro de $(...) e um array
+    # preenchido no subshell se perderia (as vítimas vazariam).
     local pid
-    for pid in "${VICTIMS[@]}"; do
+    while read -r pid; do
         kill -KILL "$pid" 2>/dev/null || true
-    done
-    VICTIMS=()
+    done <"$T/victims"
     pkill -f "stub-cpulimit-marker $T" 2>/dev/null || true
     rm -rf "$T"
 }
@@ -167,7 +168,7 @@ finish() {
 spawn_stubborn_victim() {
     bash -c 'trap "" TERM; while :; do sleep 1; done' victim "$@" >/dev/null 2>&1 &
     local pid=$!
-    VICTIMS+=("$pid")
+    echo "$pid" >>"$T/victims"
     for _ in $(seq 1 50); do
         [ -s "/proc/$pid/cmdline" ] && break
         sleep 0.02

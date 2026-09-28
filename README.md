@@ -44,16 +44,20 @@ Quatro camadas, todas configuráveis em `/etc/cpu-watchdog.conf`:
   escolhe mal. Duas partes:
   - **earlyoom** (daemon, reage em ~1s, config em `config/earlyoom.default`):
     SIGTERM quando RAM disponível <= 6% **e** swap livre <= 10%, SIGKILL em
-    3%/5%. `--prefer` mira claude/node/php; `--avoid` protege sshd, systemd,
-    docker, bancos, tailscaled. Rede de segurança contra picos súbitos.
+    3%/5%. `--prefer` mira node/php/chrome (onde rodam vite, jest, phpunit,
+    browsers headless); `--avoid` protege sshd, systemd, docker, bancos,
+    tailscaled. Sessões `claude` não têm bônus: só morrem depois, pelo
+    tamanho. Rede de segurança contra picos súbitos.
   - **no watchdog** (a cada minuto), para o que é lento:
     - 4a: processo com RSS >= `MEM_PROC_KILL_MB` por
       `MEM_PROC_SUSTAIN_CHECKS` minutos -> SIGTERM; SIGKILL na execução
       seguinte se ignorar.
     - 4b: máquina com RAM disponível <= `MEM_AVAIL_KILL_PCT`% e swap livre
       <= `MEM_SWAP_FREE_KILL_PCT`% por `MEM_SYS_SUSTAIN_CHECKS` minutos ->
-      SIGTERM no maior processo (priorizando `MEM_PREFER_REGEX`), um por
-      vez. Antes disso, alerta (com cooldown) ao cruzar
+      SIGTERM no maior processo, um por vez, nesta ordem: primeiro quem
+      casa `MEM_PREFER_FIRST_REGEX` (cmdline — ferramentas de teste/build
+      como vite e phpunit), depois `MEM_PREFER_REGEX` (comm — sessões
+      claude, node, php), depois o resto. Antes disso, alerta (com cooldown) ao cruzar
       `MEM_AVAIL_WARN_PCT` / `MEM_SWAP_USED_WARN_PCT`, listando os maiores
       grupos por nome (ex.: `20×claude=5361MB`). Em host sem swap, o
       critério depende só da RAM.

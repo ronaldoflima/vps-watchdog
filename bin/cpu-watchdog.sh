@@ -795,6 +795,31 @@ mv "${MEM_COUNTS_FILE}.new" "$MEM_COUNTS_FILE"
 
 ## 4b: pressão de memória da máquina toda ##
 
+# Candidatos com RSS >= MEM_VICTIM_MIN_MB, como "prioridade rss pid comm":
+#   2 = cmdline casa MEM_PREFER_FIRST_REGEX (ex.: vite, phpunit — que aparecem
+#       como node/php e por isso não dá para separar pelo comm);
+#   1 = comm casa MEM_PREFER_REGEX;
+#   0 = demais.
+mem_victim_candidates() {
+    local pref rss pid comm
+
+    while read -r pref rss pid comm; do
+        if [ -n "${MEM_PREFER_FIRST_REGEX:-}" ] &&
+           get_cmdline "$pid" "$comm" | grep -Eq -- "$MEM_PREFER_FIRST_REGEX"; then
+            pref=2
+        fi
+        printf '%s %s %s %s\n' "$pref" "$rss" "$pid" "$comm"
+    done < <(
+        awk -v re="${MEM_PREFER_REGEX:-^$}" -v min="${MEM_VICTIM_MIN_MB:-200}" '
+            $2 >= min {
+                pid = $1; rss = $2
+                $1 = ""; $2 = ""
+                sub(/^ +/, "")
+                printf "%d %d %s %s\n", ($0 ~ re), rss, pid, $0
+            }' <<<"$MEM_SNAPSHOT"
+    )
+}
+
 old_sys_count=$(cat "$MEM_SYS_COUNT_FILE" 2>/dev/null || echo 0)
 [[ "$old_sys_count" =~ ^[0-9]+$ ]] || old_sys_count=0
 
@@ -824,16 +849,7 @@ if [ "$new_sys_count" -ge "$MEM_SYS_SUSTAIN_CHECKS" ]; then
             killed=1
             break
         fi
-    done < <(
-        awk -v re="${MEM_PREFER_REGEX:-^$}" -v min="${MEM_VICTIM_MIN_MB:-200}" '
-            $2 >= min {
-                pid = $1; rss = $2
-                $1 = ""; $2 = ""
-                sub(/^ +/, "")
-                printf "%d %d %s %s\n", ($0 ~ re), rss, pid, $0
-            }' <<<"$MEM_SNAPSHOT" |
-            sort -k1,1rn -k2,2rn
-    )
+    done < <(mem_victim_candidates | sort -k1,1rn -k2,2rn)
 
     if [ "$killed" -eq 0 ]; then
         log "MEM_SYS_HIGH nenhum candidato fora da whitelist com >=${MEM_VICTIM_MIN_MB:-200}MB"
