@@ -5,7 +5,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 mapfile -t stubs < <(find tests/stubs -type f | sort)
-scripts=(bin/cpu-watchdog.sh install.sh tests/*.sh "${stubs[@]}")
+scripts=(bin/cpu-watchdog.sh bin/cpu-watchdog-ctl.sh install.sh tests/*.sh "${stubs[@]}")
 rc=0
 
 echo "== bash -n"

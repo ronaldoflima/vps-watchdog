@@ -44,6 +44,9 @@ fi
 echo "==> Script principal"
 install_if_changed "$REPO_DIR/bin/cpu-watchdog.sh" /usr/local/bin/cpu-watchdog.sh 755
 
+echo "==> Ferramenta de gerenciamento (status/log/unthrottle/whitelist)"
+install_if_changed "$REPO_DIR/bin/cpu-watchdog-ctl.sh" /usr/local/bin/cpu-watchdog-ctl 755
+
 echo "==> Unidades systemd"
 install_if_changed "$REPO_DIR/systemd/cpu-watchdog.service" /etc/systemd/system/cpu-watchdog.service
 install_if_changed "$REPO_DIR/systemd/cpu-watchdog.timer" /etc/systemd/system/cpu-watchdog.timer
@@ -116,6 +119,7 @@ echo "==> Resumo"
         echo "  Telegram:                 desativado (edite TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID em /etc/cpu-watchdog.conf pra ativar)"
     fi
     echo "  Editar:                   sudo \$EDITOR /etc/cpu-watchdog.conf   (não precisa reiniciar nada, o timer lê o arquivo a cada execução)"
+    echo "  Ver/gerenciar:            sudo cpu-watchdog-ctl   (menu interativo: ver o que está limitado, liberar, colocar na whitelist)"
 )
 
 echo

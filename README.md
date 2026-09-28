@@ -182,6 +182,7 @@ redigido). Arquivos novos são criados com `umask 077` (log `600`, estado
 | O quê | Onde |
 |---|---|
 | Script | `/usr/local/bin/cpu-watchdog.sh` |
+| Ferramenta de gerenciamento | `/usr/local/bin/cpu-watchdog-ctl` |
 | Config | `/etc/cpu-watchdog.conf` |
 | Estado (não editar) | `/var/lib/cpu-watchdog/*.tsv` |
 | Log de ações | `/var/log/cpu-watchdog.log` (e `journalctl -u cpu-watchdog`) |
@@ -192,17 +193,43 @@ redigido). Arquivos novos são criados com `umask 077` (log `600`, estado
 
 ## Operação
 
+O jeito mais simples de ver o que está sendo limitado e agir, sem precisar
+saber os caminhos de arquivo nem comandos de systemd de cor:
+
+```bash
+sudo cpu-watchdog-ctl            # menu interativo
+sudo cpu-watchdog-ctl status     # o que está limitado agora + snapshot da máquina
+sudo cpu-watchdog-ctl log 100    # últimas 100 linhas do log
+```
+
+Parar um throttle ativo (libera o processo, mata só o `cpulimit` associado):
+
+```bash
+sudo cpu-watchdog-ctl unthrottle <PID>   # PID do processo alvo, não o do cpulimit
+sudo cpu-watchdog-ctl unthrottle all     # libera todos de uma vez
+```
+
+Isso resolve só o throttle atual — se o processo continuar consumindo
+demais, ele volta a ser limitado no próximo ciclo. Para isentar de vez, use
+a whitelist:
+
+```bash
+sudo cpu-watchdog-ctl whitelist-cpu qdrant           # nunca mais throttle de CPU (Camadas 1-3)
+sudo cpu-watchdog-ctl whitelist-mem qdrant           # nunca mais kill por memória (Camada 4)
+sudo cpu-watchdog-ctl whitelist-cmdline 'meu-job\.py' # quando o nome do processo é genérico (python, node, php)
+```
+
+Não precisa reiniciar nada depois de mexer na whitelist — o watchdog lê
+`/etc/cpu-watchdog.conf` a cada execução (1x/min).
+
+Comandos equivalentes "na mão", sem o `cpu-watchdog-ctl` (o que o script
+acima faz por baixo dos panos):
+
 ```bash
 systemctl status cpu-watchdog.timer      # está rodando?
 tail -f /var/log/cpu-watchdog.log        # ações em tempo real
 systemctl stop cpu-watchdog.timer        # pausar
-```
-
-Liberar um processo já throttled manualmente (mata o `cpulimit` associado,
-não o processo alvo):
-
-```bash
-systemctl stop cpu-watchdog-limit-<PID>-<starttime>.scope
+systemctl stop cpu-watchdog-limit-<PID>-<starttime>.scope   # liberar 1 throttle
 # ou: pkill -f "cpulimit -p <PID>"
 ```
 
@@ -228,7 +255,7 @@ sudo systemctl stop 'cpu-watchdog-limit-*.scope'   # solta throttles ativos
 sudo systemctl disable --now cpu-watchdog.timer
 sudo systemctl stop 'cpu-watchdog-limit-*.scope'
 sudo rm /etc/systemd/system/cpu-watchdog.service /etc/systemd/system/cpu-watchdog.timer
-sudo rm /usr/local/bin/cpu-watchdog.sh
+sudo rm /usr/local/bin/cpu-watchdog.sh /usr/local/bin/cpu-watchdog-ctl
 sudo rm -r /var/lib/cpu-watchdog /run/cpu-watchdog.lock
 sudo cp /etc/cpu-watchdog.conf ~/cpu-watchdog.conf.bak && sudo rm /etc/cpu-watchdog.conf  # contém o token
 sudo rm /etc/systemd/system/tailscaled.service.d/oom.conf   # se existir
