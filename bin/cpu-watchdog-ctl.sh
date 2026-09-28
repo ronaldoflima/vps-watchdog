@@ -119,15 +119,14 @@ comm_of() {
 }
 
 status() {
-    echo "== cpu-watchdog =="
-    if systemctl is-active --quiet cpu-watchdog.timer 2>/dev/null; then
-        echo "timer: ativo"
-    else
-        echo "timer: INATIVO — nada está sendo monitorado agora"
-    fi
+    local timer_state="ativo"
+    systemctl is-active --quiet cpu-watchdog.timer 2>/dev/null || timer_state="INATIVO"
 
-    echo
-    echo "-- Throttle de CPU ativo agora --"
+    # O que importa primeiro: quem está limitado agora. O resto (log,
+    # snapshot da máquina, timer) é detalhe e vai depois.
+    echo "########################################"
+    echo "# PROCESSOS LIMITADOS AGORA"
+    echo "########################################"
     local any=0
     if [ -f "$LIMITED_FILE" ]; then
         while IFS=$'\t' read -r key cl_pid limit applied_at reason; do
@@ -135,12 +134,20 @@ status() {
             local pid="${key%%:*}"
             if [ -n "${cl_pid:-}" ] && kill -0 "$cl_pid" 2>/dev/null; then
                 any=1
-                printf '  pid %-8s (%s) limitado a %s%% desde %s\n      motivo: %s\n' \
+                printf '  >> pid %-8s (%s) limitado a %s%% desde %s\n     motivo: %s\n' \
                     "$pid" "$(comm_of "$pid")" "$limit" "$applied_at" "$reason"
             fi
         done <"$LIMITED_FILE"
     fi
-    [ "$any" -eq 1 ] || echo "  (nenhum)"
+    if [ "$any" -eq 0 ]; then
+        echo "  nenhum — nada sendo limitado no momento."
+    fi
+
+    echo
+    echo "----------------------------------------"
+    echo "detalhes"
+    echo "----------------------------------------"
+    echo "timer: $timer_state"
 
     echo
     echo "-- Últimas 10 linhas do log --"
