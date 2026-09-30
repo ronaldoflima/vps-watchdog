@@ -31,6 +31,12 @@ Quatro camadas, todas configuráveis em `/etc/cpu-watchdog.conf`:
   capacidade total (nproc × 100) por `AGG_SUSTAIN_CHECKS` minutos seguidos,
   limita até `AGG_MAX_THROTTLES` processos (os que mais consomem no momento)
   a `AGG_LIMIT_PERCENT`% cada.
+- **Liberação automática**: throttle não é permanente. O watchdog mede o uso
+  real do processo limitado (`utime+stime` do `/proc`, não o `%CPU` médio do
+  `ps`); se ficar abaixo de `RELEASE_IDLE_PCT`% do limite por
+  `RELEASE_SUSTAIN_CHECKS` minutos, o `cpulimit` é removido e o processo fica
+  isento de novo throttle por `RELEASE_GRACE_MIN` minutos.
+  `RELEASE_SUSTAIN_CHECKS=0` desativa.
 - **Camada 3 — fork bomb**: cobre o caso de N processos com a **mesma linha
   de comando completa**, cada um sozinho já acima de `CPU_THRESHOLD` (ex.:
   um `while :; do :; done` disparado várias vezes com `&`). Throttle não

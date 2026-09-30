@@ -54,6 +54,18 @@ AGG_TOP_N=5
 AGG_MAX_THROTTLES=5
 AGG_LIMIT_PERCENT=20
 
+# --- Liberação automática de throttle ---
+# Mede o uso REAL do processo limitado (utime+stime entre execuções). Sob
+# cpulimit o uso satura no limite; se ficar abaixo de RELEASE_IDLE_PCT% do
+# limite por RELEASE_SUSTAIN_CHECKS minutos seguidos, o throttle é removido.
+# 0 desativa (o throttle só cai quando o processo morre ou via
+# `cpu-watchdog-ctl unthrottle`).
+RELEASE_SUSTAIN_CHECKS=3
+RELEASE_IDLE_PCT=50
+# Após liberar, o processo fica isento de novo throttle por este tempo (o %CPU
+# do ps é média de vida e continuaria alto, re-limitando o processo à toa).
+RELEASE_GRACE_MIN=30
+
 # --- Camada 3: fork bomb (várias cópias idênticas do mesmo comando) ---
 FORKBOMB_MIN_COUNT=3
 FORKBOMB_SUSTAIN_CHECKS=3

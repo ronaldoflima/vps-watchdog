@@ -34,8 +34,10 @@ mkdir -p "$STATE_DIR"
 COUNTS_FILE="$STATE_DIR/counts.tsv"
 LIMITED_FILE="$STATE_DIR/limited.tsv"
 AGG_COUNT_FILE="$STATE_DIR/agg_count"
+RELEASE_FILE="$STATE_DIR/release.tsv"
+GRACE_FILE="$STATE_DIR/released.tsv"
 
-touch "$COUNTS_FILE" "$LIMITED_FILE"
+touch "$COUNTS_FILE" "$LIMITED_FILE" "$RELEASE_FILE" "$GRACE_FILE"
 
 # Impede duas execuções simultâneas do watchdog.
 exec 9>"$LOCK_FILE"
@@ -307,6 +309,19 @@ while IFS=$'\t' read -r key cpulimit_pid limit applied_at reason; do
     fi
 done <"$LIMITED_FILE"
 
+NOW=$(date +%s)
+
+# Processos liberados por ociosidade ficam isentos de novo throttle por
+# RELEASE_GRACE_MIN minutos: o %CPU do ps é média de vida e continuaria alto,
+# re-limitando o processo logo em seguida.
+declare -A GRACE
+
+while IFS=$'\t' read -r key until_epoch; do
+    if [ -n "${key:-}" ] && [ "${until_epoch:-0}" -gt "$NOW" ]; then
+        GRACE["$key"]="$until_epoch"
+    fi
+done <"$GRACE_FILE"
+
 # Aplica cpulimit num PID, se ainda não estiver limitado.
 #
 # key = "pid:starttime", usado para deduplicação e identificação segura
@@ -318,7 +333,7 @@ apply_throttle() {
     local comm="$4"
     local reason="$5"
 
-    if [ -n "${LIMITED[$key]:-}" ]; then
+    if [ -n "${LIMITED[$key]:-}" ] || [ -n "${GRACE[$key]:-}" ]; then
         return 0
     fi
 
@@ -335,12 +350,15 @@ apply_throttle() {
         # sobrou no cgroup quando o script termina — o throttle morria em
         # segundos. Com systemd-run --scope ele ganha um scope próprio
         # (systemd-run faz exec, então $! é o PID do próprio cpulimit).
+        # O 9>&- é essencial: o cpulimit vive por horas/dias e, herdando o fd 9
+        # (o flock do watchdog), segurava o lock — toda execução seguinte saía
+        # em "flock -n" e o watchdog ficava cego enquanto houvesse throttle.
         if command -v systemd-run >/dev/null 2>&1; then
             systemd-run --scope --quiet --collect \
                 --unit="cpu-watchdog-limit-${key/:/-}" \
-                cpulimit -p "$pid" -l "$limit" -z >/dev/null 2>&1 &
+                cpulimit -p "$pid" -l "$limit" -z >/dev/null 2>&1 9>&- &
         else
-            cpulimit -p "$pid" -l "$limit" -z >/dev/null 2>&1 &
+            cpulimit -p "$pid" -l "$limit" -z >/dev/null 2>&1 9>&- &
         fi
         local cl_pid=$!
         sleep 0.3
@@ -514,7 +532,7 @@ if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
 
         key="${pid}:${start}"
 
-        if [ -n "${LIMITED[$key]:-}" ]; then
+        if [ -n "${LIMITED[$key]:-}" ] || [ -n "${GRACE[$key]:-}" ]; then
             continue
         fi
 
@@ -889,6 +907,93 @@ agora: ${MEM_STATUS}"
     fi
 fi
 
+### Liberação de throttles de processos que ficaram ociosos ###
+#
+# Mede o uso REAL de CPU do alvo entre duas execuções (utime+stime de
+# /proc/<pid>/stat), não o %CPU médio do ps. Sob cpulimit o uso satura no
+# limite; se ficar abaixo de RELEASE_IDLE_PCT% desse limite por
+# RELEASE_SUSTAIN_CHECKS execuções seguidas, o pico acabou e o throttle cai.
+# RELEASE_SUSTAIN_CHECKS=0 desativa.
+
+proc_cpu_ticks() {
+    awk '{
+        sub(/^.*\) /, "")
+        print $12 + $13
+    }' "$PROC_DIR/$1/stat" 2>/dev/null
+}
+
+declare -A RELEASED
+
+release_idle_throttles() {
+    local sustain="${RELEASE_SUSTAIN_CHECKS:-3}"
+    local idle_pct="${RELEASE_IDLE_PCT:-50}"
+    local grace_min="${RELEASE_GRACE_MIN:-30}"
+    local hz key ticks epoch idle cl_pid limit applied_at reason pid
+    local elapsed used threshold scope
+
+    [ "$sustain" -gt 0 ] || { : >"$RELEASE_FILE"; return 0; }
+
+    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+
+    local -A prev_ticks prev_epoch prev_idle
+    while IFS=$'\t' read -r key ticks epoch idle; do
+        if [ -n "${key:-}" ]; then
+            prev_ticks["$key"]="$ticks"
+            prev_epoch["$key"]="$epoch"
+            prev_idle["$key"]="${idle:-0}"
+        fi
+    done <"$RELEASE_FILE"
+
+    : >"${RELEASE_FILE}.new"
+
+    while IFS=$'\t' read -r key cl_pid limit applied_at reason; do
+        [ -n "${key:-}" ] || continue
+        pid="${key%%:*}"
+
+        [ -d "$PROC_DIR/$pid" ] && [ -n "${cl_pid:-}" ] && [ -d "$PROC_DIR/$cl_pid" ] || continue
+        [ "$(pid_start_ticks "$pid" || true)" = "${key#*:}" ] || continue
+
+        ticks=$(proc_cpu_ticks "$pid") || true
+        [ -n "${ticks:-}" ] || continue
+
+        idle=0
+        if [ -n "${prev_ticks[$key]:-}" ]; then
+            elapsed=$(( NOW - prev_epoch[$key] ))
+            [ "$elapsed" -ge 1 ] || elapsed=1
+            used=$(( (ticks - prev_ticks[$key]) * 100 / (hz * elapsed) ))
+            threshold=$(( ${limit:-50} * idle_pct / 100 ))
+            if [ "$used" -lt "$threshold" ]; then
+                idle=$(( ${prev_idle[$key]:-0} + 1 ))
+            fi
+        fi
+
+        if [ "$idle" -ge "$sustain" ]; then
+            scope="cpu-watchdog-limit-${key/:/-}.scope"
+            if ! systemctl stop "$scope" >/dev/null 2>&1; then
+                kill "$cl_pid" 2>/dev/null || true
+            fi
+            RELEASED["$key"]=1
+            printf '%s\t%s\n' "$key" "$(( NOW + grace_min * 60 ))" >>"$GRACE_FILE"
+            log "RELEASE pid=$pid -> throttle removido: uso real abaixo de ${threshold}% por ${sustain} execuções (motivo original: ${reason:-?})"
+            notify "✅ cpu-watchdog: throttle removido do pid $pid (uso real baixo por ${sustain}min)."
+        else
+            printf '%s\t%s\t%s\t%s\n' "$key" "$ticks" "$NOW" "$idle" >>"${RELEASE_FILE}.new"
+        fi
+    done <"$LIMITED_FILE"
+
+    mv "${RELEASE_FILE}.new" "$RELEASE_FILE"
+}
+
+release_idle_throttles
+
+: >"${GRACE_FILE}.new"
+while IFS=$'\t' read -r key until_epoch; do
+    if [ -n "${key:-}" ] && [ "${until_epoch:-0}" -gt "$NOW" ]; then
+        printf '%s\t%s\n' "$key" "$until_epoch" >>"${GRACE_FILE}.new"
+    fi
+done <"$GRACE_FILE"
+mv "${GRACE_FILE}.new" "$GRACE_FILE"
+
 ### Limpeza de estados antigos ###
 
 : >"${LIMITED_FILE}.new"
@@ -900,6 +1005,10 @@ while IFS=$'\t' read -r key cpulimit_pid limit applied_at reason; do
     fi
 
     pid="${key%%:*}"
+
+    if [ -n "${RELEASED[$key]:-}" ]; then
+        continue
+    fi
 
     # Mantém apenas se o processo alvo e o cpulimit ainda existem.
     if [ -d "$PROC_DIR/$pid" ] &&

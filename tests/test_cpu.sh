@@ -85,6 +85,37 @@ test_aggregate_below_threshold_does_nothing() {
     assert_not_contains "$(log_content)" "AGG_HIGH"
 }
 
+test_cpulimit_does_not_hold_watchdog_lock() {
+    local p; p=$(spawn_victim); link_proc "$p"
+    ps_cpu "$p" 95 hog
+    run_watchdog; run_watchdog
+    assert_contains "$(calls cpulimit)" "-p $p -l 50 -z"
+    flock -n "$T/lock" true || fail "cpulimit vivo segurando o flock do watchdog"
+}
+
+test_idle_throttled_process_is_released_and_not_relimited() {
+    local p; p=$(spawn_victim); link_proc "$p"
+    EXTRA_CONF='RELEASE_SUSTAIN_CHECKS=2' write_conf
+    ps_cpu "$p" 95 hog
+    run_watchdog; run_watchdog
+    assert_contains "$(calls cpulimit)" "-p $p -l 50 -z"
+    run_watchdog
+    assert_eq "" "$(log_content | grep RELEASE || true)" "(1 medição ociosa de 2)"
+    run_watchdog
+    assert_contains "$(log_content)" "RELEASE pid=$p"
+    assert_contains "$(calls systemctl)" "stop cpu-watchdog-limit-${p}-"
+    run_watchdog; run_watchdog
+    assert_eq 1 "$(calls cpulimit | wc -l)" "(grace impede novo throttle)"
+}
+
+test_release_disabled_keeps_throttle() {
+    local p; p=$(spawn_victim); link_proc "$p"
+    EXTRA_CONF='RELEASE_SUSTAIN_CHECKS=0' write_conf
+    ps_cpu "$p" 95 hog
+    for _ in 1 2 3 4 5 6; do run_watchdog; done
+    assert_not_contains "$(log_content)" "RELEASE"
+}
+
 run_test test_single_process_throttled_after_sustain_checks
 run_test test_throttle_uses_own_systemd_scope
 run_test test_throttle_not_reapplied_to_same_process
@@ -94,4 +125,7 @@ run_test test_whitelisted_comm_never_throttled
 run_test test_whitelisted_cmdline_never_throttled
 run_test test_aggregate_load_throttles_top_consumers_up_to_limit
 run_test test_aggregate_below_threshold_does_nothing
+run_test test_cpulimit_does_not_hold_watchdog_lock
+run_test test_idle_throttled_process_is_released_and_not_relimited
+run_test test_release_disabled_keeps_throttle
 finish
