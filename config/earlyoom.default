@@ -1,0 +1,14 @@
+# Gerenciado junto com o cpu-watchdog (ver /etc/cpu-watchdog.conf, Camada 4).
+#
+# SIGTERM quando RAM disponível <= 6% E swap livre <= 10% do total;
+# SIGKILL em 3% / 5%. Reage em ~1s — é a rede de segurança contra o OOM do
+# kernel, que num incidente real matou systemd, dbus e o serviço principal da
+# máquina em vez dos processos que estavam inflando a memória (dezenas de
+# sessões claude/node/php).
+#
+# --prefer: node/php/chrome — onde rodam vite, jest, phpunit e browsers
+#           headless que os agentes sobem para testar. As sessões Claude Code
+#           ficam de fora de propósito: só morrem depois, pelo tamanho.
+# --avoid:  acesso remoto, init, runtime de containers e bancos.
+# Os kills são relatados no Telegram pelo cpu-watchdog (Camada 4c).
+EARLYOOM_ARGS="-m 6,3 -s 10,5 -r 3600 --prefer '^(node|php|php8[.]3|chrome|chrome-devtools)$' --avoid '^(sshd|systemd|systemd-.*|init|dbus-daemon|dockerd|containerd|containerd-shim|postgres|qdrant|tailscaled|earlyoom|cpulimit)$'"

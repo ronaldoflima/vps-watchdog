@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_DIR/calls/systemctl"
+case "$*" in
+    *is-active*earlyoom*) [ -f "$STUB_DIR/earlyoom_active" ] ;;
+    *) exit 0 ;;
+esac

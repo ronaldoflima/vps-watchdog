@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "${STUB_NPROC:-4}"

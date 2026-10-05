@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_DIR/calls/cpulimit"
+ln -sfn "/proc/$$" "$STUB_DIR/proc/$$"
+exec -a "stub-cpulimit-marker $STUB_DIR" sleep 30
