@@ -29,3 +29,30 @@ jobs:
 
       - name: Testes
         run: tests/run.sh
+
+  arch:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      # Reap orphaned test victims so kill -0 does not see lingering zombies.
+      options: --init
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Tools
+        run: |
+          pacman -Syu --needed --noconfirm git shellcheck systemd procps-ng util-linux gawk sed diffutils shadow
+          shellcheck --version
+          bash --version | head -1
+
+      - uses: actions/checkout@v4
+
+      - name: Lint (bash -n, shellcheck, systemd-analyze verify)
+        run: tests/lint.sh
+
+      - name: Tests (unprivileged)
+        run: |
+          useradd -m watchdog-test
+          chmod -R a+rX .
+          runuser -u watchdog-test -- bash tests/run.sh

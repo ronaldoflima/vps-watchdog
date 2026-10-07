@@ -25,20 +25,50 @@ install_if_changed() {
     CHANGED=1
 }
 
-echo "==> Dependências"
+echo "==> Dependencies"
+PACKAGE_MANAGER=""
+if command -v pacman >/dev/null 2>&1; then
+    PACKAGE_MANAGER=pacman
+elif command -v apt-get >/dev/null 2>&1; then
+    PACKAGE_MANAGER=apt-get
+fi
+
 if command -v cpulimit >/dev/null 2>&1; then
     echo "  cpulimit ok"
 else
-    echo "  instalando cpulimit..."
-    apt-get update -qq
-    apt-get install -y cpulimit
+    case "$PACKAGE_MANAGER" in
+        apt-get)
+            echo "  installing cpulimit..."
+            apt-get update -qq
+            apt-get install -y cpulimit
+            ;;
+        pacman)
+            echo "  cpulimit is available from the AUR; install it as a regular user (e.g. yay -S cpulimit)."
+            echo "  Continuing without cpulimit: Layers 1–2 will only log and alert."
+            ;;
+        *)
+            echo "No supported package manager (apt-get or pacman); install cpulimit and earlyoom before rerunning." >&2
+            exit 1
+            ;;
+    esac
 fi
 if command -v earlyoom >/dev/null 2>&1; then
     echo "  earlyoom ok"
 else
-    echo "  instalando earlyoom..."
-    apt-get update -qq
-    apt-get install -y earlyoom
+    echo "  installing earlyoom..."
+    case "$PACKAGE_MANAGER" in
+        apt-get)
+            apt-get update -qq
+            apt-get install -y earlyoom
+            ;;
+        pacman)
+            pacman -S --needed --noconfirm earlyoom
+            ;;
+        *)
+            echo "No supported package manager (apt-get or pacman); install earlyoom before rerunning." >&2
+            exit 1
+            ;;
+    esac
 fi
 
 echo "==> Script principal"

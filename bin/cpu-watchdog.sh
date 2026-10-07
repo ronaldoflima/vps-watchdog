@@ -1049,7 +1049,9 @@ release_idle_throttles() {
         [ -n "${key:-}" ] || continue
         pid="${key%%:*}"
 
-        [ -d "$PROC_DIR/$pid" ] && [ -n "${cl_pid:-}" ] && [ -d "$PROC_DIR/$cl_pid" ] || continue
+        [ -d "$PROC_DIR/$pid" ] || continue
+        [ -n "${cl_pid:-}" ] || continue
+        [ -d "$PROC_DIR/$cl_pid" ] || continue
         [ "$(pid_start_ticks "$pid" || true)" = "${key#*:}" ] || continue
 
         ticks=$(proc_cpu_ticks "$pid") || true

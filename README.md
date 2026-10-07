@@ -94,13 +94,16 @@ mesmo PID depois.
 ## Requisitos e suporte
 
 Alvo: **Linux com systemd**, rodando como root. Testado em Ubuntu 24.04
-(systemd 255, kernel 6.8); o CI roda em Ubuntu 22.04 e 24.04.
+(systemd 255, kernel 6.8); o CI roda em Ubuntu 22.04, Ubuntu 24.04 e num
+container `archlinux:latest`. O job Arch valida lint e testes, sem iniciar
+serviços systemd dentro do container.
 
 | Dependência | Uso | Obrigatória? |
 |---|---|---|
 | bash >= 4.4 | `mapfile -d`, arrays associativos | sim |
 | systemd (`systemctl`, `systemd-run`) | timer, scope próprio do `cpulimit` | sim |
 | procps (`ps`), util-linux (`flock`, `logger`), coreutils, GNU sed, awk | coleta e log | sim |
+| diffutils (`cmp`, `diff`) | instalação idempotente e comparação de config | sim — instalador |
 | `/proc/meminfo`, `/proc/<pid>/{stat,cmdline}` | medição | sim |
 | `cpulimit` | throttle (Camadas 1–2) | não — sem ele o watchdog só alerta |
 | `earlyoom` | picos súbitos de memória | não — recomendado |
@@ -108,9 +111,11 @@ Alvo: **Linux com systemd**, rodando como root. Testado em Ubuntu 24.04
 | `/proc/pressure/memory` (PSI, kernel >= 4.20) | contexto nos alertas | não — mostra `?` |
 | `tailscaled` | drop-in de proteção OOM | não — só aplicado se existir |
 
-- O `install.sh` usa `apt-get` para instalar `cpulimit` e `earlyoom`: pronto
-  para Debian/Ubuntu. Em outras distros, instale as dependências pelo gerenciador
-  de pacotes local antes de rodar o script (ele pula o que já existe).
+- O `install.sh` suporta Debian/Ubuntu (`apt-get`) e Arch Linux (`pacman`).
+  No Arch, instala `earlyoom` dos repositórios oficiais e continua sem
+  `cpulimit` se ele estiver ausente; veja as instruções do AUR abaixo. Em outras
+  distros, instale ambas as dependências antes de rodar o script
+  (ele pula o que já existe).
 - GNU sed é necessário (`sed -z` e a flag `I` na sanitização). BusyBox/Alpine
   não é suportado.
 - Containers sem systemd (Docker comum, WSL sem systemd) não são suportados.
@@ -120,6 +125,23 @@ Alvo: **Linux com systemd**, rodando como root. Testado em Ubuntu 24.04
 ```bash
 sudo ./install.sh
 ```
+
+No **Debian/Ubuntu**, o instalador instala `cpulimit` e `earlyoom` via apt
+quando estiverem ausentes.
+
+No **Arch Linux**, mantenha o sistema atualizado com `sudo pacman -Syu` antes
+de rodar o instalador. Instale `diffutils` (`sudo pacman -S --needed diffutils`)
+para comparar arquivos e configurações. O instalador instala `earlyoom` com
+`pacman -S --needed --noconfirm earlyoom`, usando a base de pacotes atual.
+O `cpulimit` está no AUR: para usar throttle de CPU, instale-o como usuário comum
+com um helper (por exemplo, `yay -S cpulimit`) e rode `sudo ./install.sh`.
+O instalador nunca compila pacotes do AUR como root. Sem `cpulimit`, as Camadas
+1–2 só registram/alertam e as Camadas 3–4 continuam funcionando.
+
+As whitelists padrão incluem `cron`/`crond` e protegem tanto `php-fpm8.3`
+quanto `php-fpm` dos kills do watchdog por memória. Numa config existente,
+adicione `crond` a `WHITELIST_COMM` e `MEM_WHITELIST_COMM`, e `php-fpm` a
+`MEM_WHITELIST_COMM` manualmente: o instalador preserva o arquivo customizado.
 
 Idempotente — rode de novo sempre que mudar algo neste repo:
 
@@ -131,7 +153,8 @@ Idempotente — rode de novo sempre que mudar algo neste repo:
   Telegram preenchidos, thresholds ajustados), o install nunca sobrescreve —
   só mostra o diff em relação ao template do repo, com valores sensíveis
   mascarados.
-- Instala `cpulimit` e `earlyoom` via apt se não estiverem presentes.
+- Instala dependências ausentes via apt no Debian/Ubuntu; no Arch, instala
+  `earlyoom` via pacman e mostra instruções do AUR para `cpulimit`.
 - **Sobrescreve** `/etc/default/earlyoom` com `config/earlyoom.default` (e
   reinicia o earlyoom) sempre que o conteúdo difere — faça backup antes da
   primeira instalação se você já tinha um earlyoom customizado.
@@ -282,10 +305,13 @@ dele.
 
 ```bash
 tests/lint.sh   # bash -n, shellcheck, systemd-analyze verify
-tests/run.sh    # testes das camadas, sanitização, notificação e config
+tests/run.sh    # testes das camadas, sanitização, notificação, config e instalador
 ```
 
-Os testes rodam sem root e sem tocar o sistema: executam o script de verdade
+Os testes exigem as ferramentas listadas acima, incluindo `diffutils` para
+os testes do instalador. Rodam sem root e sem tocar o sistema. Os testes do
+instalador usam destinos temporários e simulam os gerenciadores de pacotes e
+serviços. Os demais executam o script de verdade
 contra processos-vítima filhos do próprio teste, com `ps`, `cpulimit`,
 `systemd-run`, `curl`, `logger`, `journalctl` e `systemctl` substituídos por
 stubs (`tests/stubs/`). Para isso o script aceita três overrides de ambiente,

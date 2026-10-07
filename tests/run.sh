@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Roda todos os tests/test_*.sh. Sem dependências além de bash + coreutils.
+# Roda todos os tests/test_*.sh sem root; veja as dependências no README.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1

@@ -17,6 +17,27 @@ test_legacy_config_without_new_keys_runs_cleanly() {
     assert_eq "" "$(cat "$T/stderr")"
 }
 
+test_arch_daemons_are_protected_by_template() {
+    sed -E \
+        -e "s|^STATE_DIR=.*|STATE_DIR=\"$T/state\"|" \
+        -e "s|^LOG_FILE=.*|LOG_FILE=\"$T/watchdog.log\"|" \
+        -e 's/^SUSTAIN_CHECKS=.*/SUSTAIN_CHECKS=1/' \
+        -e 's/^MEM_PROC_SUSTAIN_CHECKS=.*/MEM_PROC_SUSTAIN_CHECKS=1/' \
+        "$EXAMPLE_CONF" >"$T/conf"
+    local cron fpm hog
+    cron=$(spawn_victim --arch-cron); fpm=$(spawn_victim --arch-fpm); hog=$(spawn_victim --control)
+    link_proc "$cron" "$fpm" "$hog"
+    ps_cpu "$cron" 99 crond
+    ps_cpu "$hog" 99 hog
+    ps_mem "$cron" 9216000 crond
+    ps_mem "$fpm" 9216000 php-fpm
+    run_watchdog || fail "template failed: $(cat "$T/stderr")"
+    assert_not_contains "$(calls cpulimit)" "-p $cron "
+    assert_contains "$(calls cpulimit)" "-p $hog "
+    assert_alive "$cron" "(Arch cron daemon must be protected)"
+    assert_alive "$fpm" "(Arch PHP-FPM must be protected)"
+}
+
 EXAMPLE_CONF="${EXAMPLE_CONF:-$REPO_DIR/config/cpu-watchdog.conf.example}"
 EARLYOOM_DEFAULT="${EARLYOOM_DEFAULT:-$REPO_DIR/config/earlyoom.default}"
 
@@ -97,6 +118,7 @@ test_env_overrides_ignored_when_running_as_root() {
 
 run_test test_example_config_runs_cleanly
 run_test test_legacy_config_without_new_keys_runs_cleanly
+run_test test_arch_daemons_are_protected_by_template
 run_test test_config_cannot_move_lock_or_proc_dir
 run_test test_env_overrides_ignored_when_running_as_root
 run_test test_example_config_ships_without_credentials
