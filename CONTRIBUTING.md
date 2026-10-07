@@ -12,7 +12,10 @@ Issues e PRs são bem-vindos. O projeto é em português (código, commits e doc
    tests/run.sh
    ```
 
-   O CI roda os mesmos dois comandos em Ubuntu 22.04 e 24.04.
+   O CI roda os mesmos dois comandos em Ubuntu 22.04, Ubuntu 24.04 e num
+   container `archlinux:latest`. Os testes rodam sem root; os testes do instalador
+   usam destinos temporários e gerenciadores de pacotes/serviços simulados,
+   sem instalar pacotes nem alterar serviços no host.
 3. **Compatibilidade de config**: `/etc/cpu-watchdog.conf` existente não pode
    quebrar. Variável nova precisa de default no script (`${VAR:-...}`) e entra
    comentada/explicada em `config/cpu-watchdog.conf.example`.

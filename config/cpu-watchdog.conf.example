@@ -17,7 +17,7 @@ LIMIT_PERCENT=50
 # sistema/acesso remoto). "claude" e "codex" são CLIs de agentes de IA (Claude Code, Codex): sessões interativas
 # de agentes de IA que fazem picos longos de CPU legítimos — troque pelos
 # seus processos equivalentes ou remova.
-WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn earlyoom dbus-daemon cron atop cpulimit cpu-watchdog.sh ps claude codex"
+WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn earlyoom dbus-daemon cron crond atop cpulimit cpu-watchdog.sh ps claude codex"
 
 # Whitelist por LINHA DE COMANDO completa (/proc/<pid>/cmdline), regex ERE.
 # Use quando o comm for genérico demais (ex.: "python", "node"), já que
@@ -113,4 +113,4 @@ MEM_PREFER_FIRST_REGEX="node_modules/[.]bin/(vite|vitest|jest|webpack|playwright
 # Nunca mortos pela camada de memória. Diferente da WHITELIST_COMM: "claude"
 # NÃO está aqui (isento de throttle de CPU, mas pode morrer por memória).
 # WHITELIST_CMDLINE também vale aqui.
-MEM_WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn systemd-network dbus-daemon cron atop cpulimit cpu-watchdog.sh ps earlyoom dockerd containerd containerd-shim docker-proxy postgres qdrant ollama tailscaled nginx apache2 php-fpm8.3 supervisord s6-supervise fail2ban-server agetty"
+MEM_WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn systemd-network dbus-daemon cron crond atop cpulimit cpu-watchdog.sh ps earlyoom dockerd containerd containerd-shim docker-proxy postgres qdrant ollama tailscaled nginx apache2 php-fpm8.3 php-fpm supervisord s6-supervise fail2ban-server agetty"
