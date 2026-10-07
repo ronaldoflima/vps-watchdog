@@ -1,5 +1,5 @@
 [Unit]
-Description=CPU watchdog - throttle processos com CPU alta sustentada
+Description=CPU watchdog - throttle processes with sustained high CPU usage
 After=network.target
 
 [Service]

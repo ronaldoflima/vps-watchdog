@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ferramentas
+      - name: Tools
         run: |
           command -v shellcheck || { sudo apt-get update -qq && sudo apt-get install -y shellcheck; }
           shellcheck --version
@@ -27,7 +27,7 @@ jobs:
       - name: Lint (bash -n, shellcheck, systemd-analyze verify)
         run: tests/lint.sh
 
-      - name: Testes
+      - name: Tests
         run: tests/run.sh
 
   arch:

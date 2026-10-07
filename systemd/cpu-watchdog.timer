@@ -1,5 +1,5 @@
 [Unit]
-Description=Roda cpu-watchdog a cada minuto
+Description=Run cpu-watchdog every minute
 
 [Timer]
 OnBootSec=1min

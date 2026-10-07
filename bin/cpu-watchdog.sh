@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Roda a cada minuto via cpu-watchdog.timer.
+# Runs every minute through cpu-watchdog.timer.
 #
-# Camada 1: processo único sustentando CPU alta por SUSTAIN_CHECKS execuções
-#           -> throttle nele.
+# Layer 1: one process sustaining high CPU for SUSTAIN_CHECKS runs
+#          -> throttle that process.
 #
-# Camada 2: uso real de CPU da máquina (deltas de /proc/stat) sustentado alto
-#           -> throttle nos que mais consumiram, respeitando AGG_MAX_THROTTLES.
+# Layer 2: sustained high actual host CPU usage (/proc/stat deltas)
+#          -> throttle top consumers, respecting AGG_MAX_THROTTLES.
 #
-# O watchdog usa flock para impedir execuções concorrentes e identifica
-# processos por PID + starttime para evitar confundir PID reutilizado.
+# Uses flock to prevent concurrent runs and identifies processes by
+# PID + starttime to handle PID reuse safely.
 set -euo pipefail
 
 umask 077
 
-# Overrides de caminho para os testes (rodam sem root). Como root eles são
-# ignorados: ninguém consegue apontar o `source` abaixo para outro arquivo
-# via ambiente herdado (sudo com env_keep, drop-in do systemd).
+# Path overrides for tests (run without root). Ignored when running as root:
+# no inherited environment can redirect the source below to another file
+# (sudo with env_keep, systemd drop-ins).
 if [ "$(id -u)" -eq 0 ]; then
     unset CPU_WATCHDOG_CONF CPU_WATCHDOG_LOCK CPU_WATCHDOG_PROC_DIR
 fi
@@ -25,7 +25,7 @@ CONF="${CPU_WATCHDOG_CONF:-/etc/cpu-watchdog.conf}"
 # shellcheck source=config/cpu-watchdog.conf.example
 source "$CONF"
 
-# Depois do source: o config não controla lock nem /proc.
+# After source: configuration cannot control the lock or /proc.
 LOCK_FILE="${CPU_WATCHDOG_LOCK:-/run/cpu-watchdog.lock}"
 PROC_DIR="${CPU_WATCHDOG_PROC_DIR:-/proc}"
 
@@ -40,7 +40,7 @@ GRACE_FILE="$STATE_DIR/released.tsv"
 
 touch "$COUNTS_FILE" "$LIMITED_FILE" "$RELEASE_FILE" "$GRACE_FILE"
 
-# Impede duas execuções simultâneas do watchdog.
+# Prevent concurrent watchdog runs.
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     exit 0
@@ -57,14 +57,14 @@ notify() {
     [ -n "${TELEGRAM_BOT_TOKEN:-}" ] &&
     [ -n "${TELEGRAM_CHAT_ID:-}" ] || return 0
 
-    # Quebra de linha viraria diretiva nova no config do curl.
+    # A newline would become a new curl configuration directive.
     if [[ "${TELEGRAM_BOT_TOKEN}${TELEGRAM_CHAT_ID}" =~ [[:cntrl:]] ]]; then
-        log "TELEGRAM desativado: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID com caractere de controle"
+        log "TELEGRAM disabled: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID contains a control character"
         return 0
     fi
 
-    # Token e chat_id vão pelo config do curl via stdin (-K -): no argv
-    # ficariam visíveis em `ps` para qualquer usuário enquanto o curl roda.
+    # Pass token and chat_id through curl configuration on stdin (-K -).
+    # In argv, they would be visible to any local user through ps while curl runs.
     curl -s --max-time 10 -K - \
         --data-urlencode "text=${msg}" \
         >/dev/null 2>&1 <<CURLCFG || true
@@ -81,10 +81,10 @@ curl_config_escape() {
 }
 
 is_whitelisted() {
-    # comm pode ter espaço (ex.: "tmux: server", "tmux: client"). WHITELIST_COMM
-    # é uma lista separada por espaço, então cada entrada só pode ser uma
-    # palavra — comparamos com a primeira palavra do comm, não o valor
-    # inteiro (senão "tmux: server" nunca bateria com nada configurável).
+    # comm can contain spaces (e.g. "tmux: server", "tmux: client").
+    # WHITELIST_COMM is space-separated, so entries can only be single words.
+    # Compare the first word of comm rather than the full value, otherwise
+    # "tmux: server" could never match a configurable entry.
     local comm="${1%% *}"
     local w
 
@@ -97,8 +97,8 @@ is_whitelisted() {
     return 1
 }
 
-# Casa a linha de comando COMPLETA contra WHITELIST_CMDLINE (regex ERE).
-# Usado quando o comm é genérico demais para a whitelist (ex.: "python").
+# Match the FULL command line against WHITELIST_CMDLINE (ERE regex).
+# Used when comm is too generic for a whitelist (e.g. "python").
 is_whitelisted_cmdline() {
     local pid="$1"
     local comm="$2"
@@ -108,7 +108,7 @@ is_whitelisted_cmdline() {
     get_cmdline "$pid" "$comm" | grep -Eq -- "$WHITELIST_CMDLINE"
 }
 
-# Isento = whitelist por comm OU por linha de comando.
+# Exempt = whitelisted by comm OR command line.
 is_exempt() {
     local pid="$1"
     local comm="$2"
@@ -120,11 +120,11 @@ pid_start_ticks() {
     local pid="$1"
 
     # /proc/<pid>/stat:
-    #   campo 2 = comm, entre parênteses
-    #   campo 22 = starttime
+    #   field 2 = comm, in parentheses
+    #   field 22 = starttime
     #
-    # Como comm pode conter espaços/parênteses, primeiro removemos tudo
-    # até o último ") ". A partir daí, starttime passa a ser o campo 20.
+    # comm can contain spaces/parentheses, so strip everything through the
+    # last ") ". After that, starttime is field 20.
     awk '{
         sub(/^.*\) /, "")
         print $20
@@ -136,8 +136,8 @@ get_cmdline() {
     local comm="$2"
     local cmdline
 
-    # 2>/dev/null ANTES do "<": senão o erro do redirect (processo que
-    # morreu entre o ps e aqui) vaza pro journal.
+    # Put 2>/dev/null BEFORE "<" to suppress redirect errors if the process
+    # died after ps took its snapshot; otherwise errors leak to the journal.
     cmdline=$(tr '\0' ' ' 2>/dev/null <"$PROC_DIR/$pid/cmdline" || true)
 
     if [ -n "$cmdline" ]; then
@@ -147,16 +147,16 @@ get_cmdline() {
     fi
 }
 
-# A cmdline de processos alheios pode carregar segredos (tokens em URL,
-# --password, DB_PASSWORD=...). Tudo que vai para log/journal passa por
-# get_safe_cmdline; a cmdline crua só é usada para casar WHITELIST_CMDLINE e
-# agrupar a Camada 3, nunca é gravada. É heurística: prefere redigir demais.
+# Other processes' command lines may contain secrets (URL tokens,
+# --password, DB_PASSWORD=...). Everything written to logs/journal passes
+# through get_safe_cmdline. Raw command lines are only used for whitelist
+# matching and Layer 3 grouping, never stored. Favor over-redaction.
 REDACTED="<redacted>"
 SECRET_NAME_RE="pass|pwd|secret|token|key|auth|credential|cookie|session|signature"
 CMDLINE_LOG_MAX=1024
 
-# Regras aplicadas a cada palavra já separada por sanitize_words (sed -z: uma
-# palavra por registro). Rodam com LC_ALL=C para byte inválido não escapar.
+# Rules applied to each word split by sanitize_words (sed -z: one word
+# per record). Use LC_ALL=C so invalid bytes cannot bypass the rules.
 SANITIZE_SED=(
     -e "s/^(-{0,2}[A-Za-z0-9_.-]*($SECRET_NAME_RE)[A-Za-z0-9_.-]*=).+/\\1$REDACTED/I"
     -e "s/^([A-Za-z0-9-]*($SECRET_NAME_RE)[A-Za-z0-9-]*:).+/\\1$REDACTED/I"
@@ -178,10 +178,10 @@ sanitized_add() {
     SANITIZED_BYTES=$(( SANITIZED_BYTES + ${#1} + 1 ))
 }
 
-# Percorre argumentos (depth 0) ou as palavras de um argumento com espaços
-# (depth 1: `sh -c '...'`, argv reescrito por setproctitle) e acumula em
-# SANITIZED. Trata o que depende da palavra anterior: flag sensível seguida
-# do valor, user:senha e flags curtas de senha de programas conhecidos.
+# Walk arguments (depth 0) or words within arguments containing spaces
+# (depth 1: sh -c, argv rewritten by setproctitle), accumulating SANITIZED.
+# Handle context from the preceding word: sensitive flags followed by values,
+# user:password and short password flags for known programs.
 sanitize_words() {
     local depth="$1"
     shift
@@ -316,9 +316,9 @@ done <"$LIMITED_FILE"
 
 NOW=$(date +%s)
 
-# Processos liberados por ociosidade ficam isentos de novo throttle por
-# RELEASE_GRACE_MIN minutos: o %CPU do ps é média de vida e continuaria alto,
-# re-limitando o processo logo em seguida.
+# Processes released due to idle usage are exempt from throttling for
+# RELEASE_GRACE_MIN minutes: ps reports a lifetime CPU average that would
+# otherwise remain high and immediately trigger another throttle.
 declare -A GRACE
 
 while IFS=$'\t' read -r key until_epoch; do
@@ -327,10 +327,10 @@ while IFS=$'\t' read -r key until_epoch; do
     fi
 done <"$GRACE_FILE"
 
-# Aplica cpulimit num PID, se ainda não estiver limitado.
+# Apply cpulimit to a PID unless it is already throttled.
 #
-# key = "pid:starttime", usado para deduplicação e identificação segura
-# do processo mesmo quando o kernel reutiliza um PID.
+# key = "pid:starttime", used for deduplication and safe identification
+# even when the kernel reuses a PID.
 apply_throttle() {
     local pid="$1"
     local key="$2"
@@ -350,14 +350,14 @@ apply_throttle() {
     cmdline=$(get_safe_cmdline "$pid" "$comm")
 
     if command -v cpulimit >/dev/null 2>&1; then
-        # O cpulimit precisa sair do cgroup do cpu-watchdog.service: é um
-        # oneshot com KillMode=control-group, então o systemd mata tudo que
-        # sobrou no cgroup quando o script termina — o throttle morria em
-        # segundos. Com systemd-run --scope ele ganha um scope próprio
-        # (systemd-run faz exec, então $! é o PID do próprio cpulimit).
-        # O 9>&- é essencial: o cpulimit vive por horas/dias e, herdando o fd 9
-        # (o flock do watchdog), segurava o lock — toda execução seguinte saía
-        # em "flock -n" e o watchdog ficava cego enquanto houvesse throttle.
+        # cpulimit must leave the cpu-watchdog.service cgroup. The service is
+        # oneshot with KillMode=control-group, so systemd kills remaining
+        # processes when the script exits, ending throttling within seconds.
+        # systemd-run --scope gives it a separate scope (systemd-run uses exec,
+        # so $! is the cpulimit PID).
+        # Closing fd 9 is essential: cpulimit can live for hours/days. Inheriting
+        # the watchdog flock would keep the lock held, making every later run
+        # exit at flock -n and leaving the watchdog blind while throttling.
         if command -v systemd-run >/dev/null 2>&1; then
             systemd-run --scope --quiet --collect \
                 --unit="cpu-watchdog-limit-${key/:/-}" \
@@ -368,11 +368,10 @@ apply_throttle() {
         local cl_pid=$!
         sleep 0.3
 
-        # Pequena validação para evitar registrar um processo cpulimit que
-        # tenha terminado imediatamente.
+        # Avoid recording a cpulimit process that exited immediately.
         if ! kill -0 "$cl_pid" 2>/dev/null; then
-            log "ERRO ao iniciar cpulimit pid=$pid comm=$comm"
-            notify "⚠️ cpu-watchdog: falha ao iniciar cpulimit para '$comm' (pid $pid)."
+            log "ERROR starting cpulimit pid=$pid comm=$comm"
+            notify "⚠️ cpu-watchdog: failed to start cpulimit for '$comm' (pid $pid)."
             return 1
         fi
 
@@ -391,36 +390,34 @@ apply_throttle() {
 
         LIMITED["$key"]="$cl_pid"
 
-        log "$reason pid=$pid comm=$comm -> limitado a ${limit}% (cpulimit pid=$cl_pid) cmd=[$cmdline]"
+        log "$reason pid=$pid comm=$comm -> limited to ${limit}% (cpulimit pid=$cl_pid) cmd=[$cmdline]"
 
-        # Mesmo sanitizada, a cmdline fica só no log local — nunca vai pro
-        # Telegram.
+        # Even sanitized command lines stay in the local log, never Telegram.
         notify "⚠️ cpu-watchdog: $reason
-processo '$comm' (pid $pid) limitado a ${limit}%.
-detalhes completos: ${LOG_FILE}"
+process '$comm' (pid $pid) limited to ${limit}%.
+full details: ${LOG_FILE}"
     else
-        log "ALERTA (cpulimit ausente) $reason pid=$pid comm=$comm cmd=[$cmdline]"
-        notify "⚠️ cpu-watchdog: $reason — processo '$comm' (pid $pid). cpulimit não instalado, nenhuma ação tomada."
+        log "ALERT (cpulimit missing) $reason pid=$pid comm=$comm cmd=[$cmdline]"
+        notify "⚠️ cpu-watchdog: $reason — process '$comm' (pid $pid). cpulimit is not installed; no action taken."
     fi
 }
 
 MY_PID=$$
 MY_PPID=$PPID
 
-# Snapshot único para que as duas camadas trabalhem sobre a mesma medição.
+# Use one snapshot so both CPU layers share the same measurement.
 #
-# Arredonda %CPU para inteiro sem criar um fork por processo no loop. comm
-# pode ter espaço (ex.: "tmux: server"): reatribuir $2 e deixar o awk
-# reconstruir $0 preserva os campos depois do pcpu — quem lê com
-# `read -r pid pcpu comm` recebe o nome inteiro no último campo, em vez de só
-# a primeira palavra (era o que fazia "tmux: server" virar "tmux:" e a
-# whitelist por comm não bater).
+# Round %CPU to an integer without forking once per process. comm can
+# contain spaces (e.g. "tmux: server"). Reassigning $2 lets awk rebuild
+# $0 while preserving fields after pcpu, so read -r pid pcpu comm gets
+# the full name in its final field. Keeping only the first word broke
+# comm whitelist matching.
 PS_SNAPSHOT=$(
     ps -eo pid=,pcpu=,comm= --no-headers |
         awk '{ $2 = int($2 + 0.5); print }'
 )
 
-### Camada 1: processo único sustentado acima de CPU_THRESHOLD ###
+### Layer 1: single process sustained above CPU_THRESHOLD ###
 
 declare -A OLD_COUNT
 
@@ -471,28 +468,28 @@ while read -r pid pcpu comm; do
             "$key" \
             "$LIMIT_PERCENT" \
             "$comm" \
-            "THROTTLE cpu=${pcpu}% por >=${SUSTAIN_CHECKS}min"; then
+            "THROTTLE cpu=${pcpu}% for >=${SUSTAIN_CHECKS}min"; then
 
-            log "Falha ao aplicar throttle pid=$pid comm=$comm"
+            log "Failed to apply throttle pid=$pid comm=$comm"
         fi
     fi
 done <<<"$PS_SNAPSHOT"
 
 mv "${COUNTS_FILE}.new" "$COUNTS_FILE"
 
-### Camada 2: uso agregado da máquina ###
+### Layer 2: aggregate host usage ###
 #
-# Mede o uso REAL de CPU entre duas execuções (deltas de /proc/stat e de
-# utime+stime por processo). O %CPU do ps é média de vida do processo e conta o
-# próprio ps do watchdog: não acompanha a carga da máquina, e a camada limitava
-# processos inocentes com a máquina quase ociosa.
+# Measure ACTUAL CPU usage between runs (/proc/stat and per-process
+# utime+stime deltas). ps %CPU is a lifetime average and includes the
+# watchdog's own ps: it does not track current host load and previously
+# caused innocent processes to be throttled on nearly idle hosts.
 
 NPROC=$(nproc)
 
 AGG_THRESHOLD_ABS=$(( AGG_CPU_THRESHOLD_PCT * NPROC ))
 
-# Linha agregada "cpu" do /proc/stat. busy não conta idle, iowait nem steal
-# (guest já está dentro de user/nice).
+# Aggregate "cpu" line from /proc/stat. busy excludes idle, iowait and
+# steal (guest is already included in user/nice).
 AGG_BUSY=""
 AGG_TOTAL=""
 read -r AGG_BUSY AGG_TOTAL <<<"$(
@@ -516,7 +513,7 @@ if [[ "$AGG_BUSY" =~ ^[0-9]+$ && "$AGG_TOTAL" =~ ^[0-9]+$ ]]; then
         IFS=$'\t' read -r AGG_PREV_BUSY AGG_PREV_TOTAL <"$AGG_SAMPLE_FILE" || true
     fi
 
-    # Sem amostra anterior, ou contador que regrediu (reboot): não avalia.
+    # No previous sample or a regressed counter (reboot): skip evaluation.
     if [[ "$AGG_PREV_BUSY" =~ ^[0-9]+$ && "$AGG_PREV_TOTAL" =~ ^[0-9]+$ ]] &&
        [ "$AGG_TOTAL" -gt "$AGG_PREV_TOTAL" ] &&
        [ "$AGG_BUSY" -ge "$AGG_PREV_BUSY" ]; then
@@ -524,10 +521,10 @@ if [[ "$AGG_BUSY" =~ ^[0-9]+$ && "$AGG_TOTAL" =~ ^[0-9]+$ ]]; then
         AGG_USAGE=$(( (AGG_BUSY - AGG_PREV_BUSY) * 100 * NPROC / AGG_D_TOTAL ))
     fi
 
-    # pid:starttime, utime+stime e comm de cada processo, sem kernel threads
-    # (PF_KTHREAD). Cada stat é lido como uma unidade: o kernel imprime o comm
-    # cru, e um \n nele quebraria o registro e esconderia o processo. Arquivo
-    # que some no meio da leitura só devolve -1 no getline.
+    # pid:starttime, utime+stime and comm for each process, excluding kernel
+    # threads (PF_KTHREAD). Read each stat as a unit: the kernel prints raw
+    # comm, whose newlines could split records and hide the process. Files
+    # that disappear during reading simply return -1 from getline.
     AGG_PROCS=$(
         awk '
             BEGIN {
@@ -551,10 +548,10 @@ if [[ "$AGG_BUSY" =~ ^[0-9]+$ && "$AGG_TOTAL" =~ ^[0-9]+$ ]]; then
     )
 fi
 
-# Maiores consumidores do último intervalo, como "uso pid comm" (uso em % de um
-# core). Só entram processos presentes nas duas amostras com o mesmo
-# pid:starttime (processo novo ou PID reaproveitado fica de fora) e acima do
-# teto que seria aplicado.
+# Top consumers in the last interval as "usage pid comm" (usage as a
+# percentage of one core). Only include processes present in both samples
+# with the same pid:starttime (exclude new processes and reused PIDs)
+# and usage above the limit that would be applied.
 agg_top_consumers() {
     awk -F'\t' -v dtotal="$AGG_D_TOTAL" -v nproc="$NPROC" -v min="$AGG_LIMIT_PERCENT" '
         NR == FNR { if (FNR > 1) prev[$1] = $2; next }
@@ -590,7 +587,7 @@ if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
 
     MAX_THROTTLES="${AGG_MAX_THROTTLES:-${AGG_TOP_N:-3}}"
 
-    log "AGG_HIGH uso agregado ${AGG_USAGE}% (limite ${AGG_THRESHOLD_ABS}% = ${AGG_CPU_THRESHOLD_PCT}% de ${NPROC} CPUs) sustentado >=${AGG_SUSTAIN_CHECKS}min -> throttling de até ${MAX_THROTTLES} processos"
+    log "AGG_HIGH aggregate usage ${AGG_USAGE}% (threshold ${AGG_THRESHOLD_ABS}% = ${AGG_CPU_THRESHOLD_PCT}% of ${NPROC} CPUs) sustained >=${AGG_SUSTAIN_CHECKS}min -> throttling up to ${MAX_THROTTLES} processes"
 
     picked=0
 
@@ -629,7 +626,7 @@ if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
             "$key" \
             "$AGG_LIMIT_PERCENT" \
             "$comm" \
-            "AGG_THROTTLE (uso agregado ${AGG_USAGE}% sustentado)"; then
+            "AGG_THROTTLE (aggregate usage ${AGG_USAGE}% sustained)"; then
 
             picked=$(( picked + 1 ))
         fi
@@ -637,7 +634,7 @@ if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
     done < <(agg_top_consumers)
 
     if [ "$picked" -eq 0 ]; then
-        log "AGG_HIGH nenhum processo acima de ${AGG_LIMIT_PERCENT}% elegível para limitar"
+        log "AGG_HIGH no process above ${AGG_LIMIT_PERCENT}% eligible for throttling"
     fi
 fi
 
@@ -648,16 +645,16 @@ else
     rm -f "$AGG_SAMPLE_FILE"
 fi
 
-### Camada 3: fork bomb (várias cópias idênticas do mesmo comando) ###
+### Layer 3: fork bomb (identical copies of the same command) ###
 #
-# Cobre o caso de N processos com a MESMA linha de comando completa, cada um
-# sozinho já acima de CPU_THRESHOLD (ex.: um `while :; do :; done` disparado
-# várias vezes). Throttle não escala nesse caso -- com processos suficientes,
-# sempre sobra gente rodando a todo vapor. Sustentado, mata todos (SIGTERM).
+# Handle N processes with the SAME full command line, each above
+# CPU_THRESHOLD (e.g. a while :; do :; done loop launched repeatedly).
+# Throttling does not scale: with enough processes, some always run at
+# full speed. If sustained, terminate all copies with SIGTERM.
 #
-# Cuidado: pools legítimos de workers (php-fpm, gunicorn, etc.) sob carga
-# pesada podem, em tese, casar com esse padrão. Se acontecer um falso
-# positivo, adicione o comando à WHITELIST_COMM.
+# Legitimate worker pools (php-fpm, gunicorn, etc.) under heavy load
+# could match this pattern. For false positives, add the command name
+# to WHITELIST_COMM.
 
 FORKBOMB_COUNT_FILE="$STATE_DIR/forkbomb_counts.tsv"
 touch "$FORKBOMB_COUNT_FILE"
@@ -718,34 +715,33 @@ for cmdline in "${!FB_GROUP_PIDS[@]}"; do
         comm="${FB_GROUP_COMM[$cmdline]}"
         safe_cmdline=$(get_safe_cmdline "${pids%% *}" "$comm")
 
-        log "FORKBOMB $count processos idênticos ('$comm') sustentado >=${FORKBOMB_SUSTAIN_CHECKS}min -> matando pids=[$pids] cmd=[$safe_cmdline]"
+        log "FORKBOMB $count identical processes ('$comm') sustained >=${FORKBOMB_SUSTAIN_CHECKS}min -> terminating pids=[$pids] cmd=[$safe_cmdline]"
 
         for kpid in $pids; do
             kill -TERM "$kpid" 2>/dev/null || true
         done
 
-        notify "🚨 cpu-watchdog: FORKBOMB detectado — $count processos idênticos ('$comm') encerrados (SIGTERM).
-detalhes completos: ${LOG_FILE}"
+        notify "🚨 cpu-watchdog: FORKBOMB detected — $count identical processes ('$comm') terminated (SIGTERM).
+full details: ${LOG_FILE}"
     fi
 done
 
 mv "${FORKBOMB_COUNT_FILE}.new" "$FORKBOMB_COUNT_FILE"
 
-### Camada 4: memória ###
+### Layer 4: memory ###
 #
-# O cron de 1 minuto é lento demais para segurar um pico súbito de memória —
-# isso é trabalho do earlyoom (reage em ~1s). Esta camada cobre o que o
-# earlyoom não vê bem:
+# A one-minute interval cannot handle sudden memory spikes; earlyoom
+# reacts in ~1s. This layer covers slower problems:
 #
-#   4a. processo único vazando (RSS >= MEM_PROC_KILL_MB por
-#       MEM_PROC_SUSTAIN_CHECKS minutos) -> SIGTERM, e SIGKILL na execução
-#       seguinte se ele ignorar;
-#   4b. máquina toda pressionada por MUITOS processos médios (ex.: 20 sessões
-#       claude de ~300 MB) -> alerta cedo e, sustentado, SIGTERM no maior
-#       processo, priorizando MEM_PREFER_REGEX. Um por vez, dando tempo da
-#       memória voltar antes de escolher outro;
-#   4c. relata no Telegram os kills que o earlyoom fez desde a última
-#       execução (o earlyoom roda com DynamicUser e não lê este .conf).
+#   4a. A leaking process (RSS >= MEM_PROC_KILL_MB for
+#       MEM_PROC_SUSTAIN_CHECKS minutes) -> SIGTERM, then SIGKILL
+#       on the next run if ignored.
+#   4b. Host pressure from MANY medium-sized processes (e.g. 20 claude
+#       sessions of ~300 MB) -> early warning, then SIGTERM to the
+#       largest process, prioritizing MEM_PREFER_REGEX. Select one at
+#       a time to allow memory to recover before choosing another.
+#   4c. Report earlyoom kills since the previous run to Telegram
+#       (earlyoom runs with DynamicUser and cannot read this .conf).
 
 MEM_COUNTS_FILE="$STATE_DIR/mem_counts.tsv"
 MEM_SYS_COUNT_FILE="$STATE_DIR/mem_sys_count"
@@ -754,11 +750,11 @@ EARLYOOM_CURSOR_FILE="$STATE_DIR/earlyoom.cursor"
 
 touch "$MEM_COUNTS_FILE"
 
-# Whitelist própria da memória: "claude" sai daqui de propósito (é isento de
-# throttle de CPU, mas pode ser morto por memória). Bancos e infra ficam.
+# Separate memory whitelist: deliberately exclude "claude" (exempt
+# from CPU throttling but eligible for memory kills). Keep databases/infra.
 is_mem_exempt() {
     local pid="$1"
-    local comm="${2%% *}"  # ver comentário em is_whitelisted()
+    local comm="${2%% *}"  # see comment in is_whitelisted()
     local w
 
     for w in ${MEM_WHITELIST_COMM:-}; do
@@ -774,7 +770,7 @@ meminfo_kb() {
     awk -v k="$1:" '$1 == k { print $2 }' "$PROC_DIR/meminfo"
 }
 
-# Top grupos por nome de processo, ex.: "20×claude=5361MB, 16×node=2318MB".
+# Top groups by process name, e.g. "20×claude=5361MB, 16×node=2318MB".
 mem_top_groups() {
     awk '{
         rss = $2
@@ -789,7 +785,7 @@ mem_top_groups() {
         awk -F'\t' '{ printf "%s%s×%s=%dMB", (NR > 1 ? ", " : ""), $2, $3, $1 }'
 }
 
-# Alerta de memória com cooldown, pra não mandar Telegram todo minuto.
+# Memory alert cooldown prevents sending Telegram messages every minute.
 mem_alert() {
     local msg="$1"
     local now last
@@ -821,11 +817,11 @@ mem_kill() {
 
     log "$reason pid=$pid comm=$comm rss=${rss}MB -> SIG$sig cmd=[$cmdline]"
     notify "🚨 cpu-watchdog: $reason
-processo '$comm' (pid $pid, ${rss} MB) recebeu SIG$sig.
-detalhes completos: ${LOG_FILE}"
+process '$comm' (pid $pid, ${rss} MB) received SIG$sig.
+full details: ${LOG_FILE}"
 }
 
-# RSS em MB. comm pode ter espaços (ex.: "tmux: server"), por isso vai no fim.
+# RSS in MB. Put comm last because it can contain spaces (e.g. "tmux: server").
 MEM_SNAPSHOT=$(
     ps -eo pid=,rss=,comm= --no-headers |
         awk '{ $2 = int($2 / 1024); print }'
@@ -838,7 +834,7 @@ SWAP_FREE_KB=$(meminfo_kb SwapFree)
 
 MEM_AVAIL_PCT=$(( MEM_AVAIL_KB * 100 / MEM_TOTAL_KB ))
 
-# Sem swap, trata como "swap esgotado" para o critério depender só da RAM.
+# Without swap, treat it as exhausted so only RAM determines the criterion.
 if [ "${SWAP_TOTAL_KB:-0}" -gt 0 ]; then
     SWAP_FREE_PCT=$(( SWAP_FREE_KB * 100 / SWAP_TOTAL_KB ))
 else
@@ -851,9 +847,9 @@ PSI_MEM_AVG60=$(
         "$PROC_DIR/pressure/memory" 2>/dev/null || echo "?"
 )
 
-MEM_STATUS="RAM livre ${MEM_AVAIL_PCT}% ($(( MEM_AVAIL_KB / 1024 ))MB), swap usado ${SWAP_USED_PCT}%, PSI mem avg60=${PSI_MEM_AVG60}"
+MEM_STATUS="available RAM ${MEM_AVAIL_PCT}% ($(( MEM_AVAIL_KB / 1024 ))MB), used swap ${SWAP_USED_PCT}%, PSI mem avg60=${PSI_MEM_AVG60}"
 
-## 4a: processo único acima de MEM_PROC_KILL_MB ##
+## 4a: single process above MEM_PROC_KILL_MB ##
 
 declare -A OLD_MEM_COUNT
 declare -A OLD_MEM_TERMED
@@ -898,9 +894,9 @@ while read -r pid rss comm; do
     if [ "$new_count" -ge "$MEM_PROC_SUSTAIN_CHECKS" ]; then
         if [ "$termed" = "1" ]; then
             mem_kill "$pid" "$comm" "$rss" KILL \
-                "MEM_PROC ignorou SIGTERM, ainda com ${rss}MB" || true
+                "MEM_PROC ignored SIGTERM, still using ${rss}MB" || true
         elif mem_kill "$pid" "$comm" "$rss" TERM \
-            "MEM_PROC ${rss}MB >= ${MEM_PROC_KILL_MB}MB por >=${MEM_PROC_SUSTAIN_CHECKS}min"; then
+            "MEM_PROC ${rss}MB >= ${MEM_PROC_KILL_MB}MB for >=${MEM_PROC_SUSTAIN_CHECKS}min"; then
             termed=1
         fi
     fi
@@ -910,13 +906,13 @@ done <<<"$MEM_SNAPSHOT"
 
 mv "${MEM_COUNTS_FILE}.new" "$MEM_COUNTS_FILE"
 
-## 4b: pressão de memória da máquina toda ##
-
-# Candidatos com RSS >= MEM_VICTIM_MIN_MB, como "prioridade rss pid comm":
-#   2 = cmdline casa MEM_PREFER_FIRST_REGEX (ex.: vite, phpunit — que aparecem
-#       como node/php e por isso não dá para separar pelo comm);
-#   1 = comm casa MEM_PREFER_REGEX;
-#   0 = demais.
+## 4b: host-wide memory pressure ##
+#
+# Candidates with RSS >= MEM_VICTIM_MIN_MB as "priority rss pid comm":
+#   2 = command line matches MEM_PREFER_FIRST_REGEX (e.g. vite, phpunit,
+#       which appear as node/php and cannot be distinguished by comm);
+#   1 = comm matches MEM_PREFER_REGEX;
+#   0 = other processes.
 mem_victim_candidates() {
     local pref rss pid comm
 
@@ -948,9 +944,9 @@ else
 fi
 
 if [ "$new_sys_count" -ge "$MEM_SYS_SUSTAIN_CHECKS" ]; then
-    log "MEM_SYS_HIGH $MEM_STATUS sustentado >=${MEM_SYS_SUSTAIN_CHECKS}min — top: $(mem_top_groups 5)"
+    log "MEM_SYS_HIGH $MEM_STATUS sustained >=${MEM_SYS_SUSTAIN_CHECKS}min — top: $(mem_top_groups 5)"
 
-    # Candidatos: preferidos primeiro, depois por RSS decrescente.
+    # Candidates: preferred first, then descending RSS.
     killed=0
     while read -r _pref rss pid comm; do
         if [ "$pid" = "$MY_PID" ] || [ "$pid" = "$MY_PPID" ] || [ "$pid" = "1" ]; then
@@ -962,32 +958,32 @@ if [ "$new_sys_count" -ge "$MEM_SYS_SUSTAIN_CHECKS" ]; then
         fi
 
         if mem_kill "$pid" "$comm" "$rss" TERM \
-            "MEM_SYS máquina sem memória (${MEM_STATUS})"; then
+            "MEM_SYS host low on memory (${MEM_STATUS})"; then
             killed=1
             break
         fi
     done < <(mem_victim_candidates | sort -k1,1rn -k2,2rn)
 
     if [ "$killed" -eq 0 ]; then
-        log "MEM_SYS_HIGH nenhum candidato fora da whitelist com >=${MEM_VICTIM_MIN_MB:-200}MB"
+        log "MEM_SYS_HIGH no non-whitelisted candidate with >=${MEM_VICTIM_MIN_MB:-200}MB"
     fi
 
-    # Zera o contador: dá MEM_SYS_SUSTAIN_CHECKS minutos para a memória voltar
-    # antes de escolher a próxima vítima.
+    # Reset the counter: allow MEM_SYS_SUSTAIN_CHECKS minutes for memory
+    # to recover before choosing the next victim.
     new_sys_count=0
 elif [ "$MEM_AVAIL_PCT" -le "$MEM_AVAIL_WARN_PCT" ] ||
      { [ "${SWAP_TOTAL_KB:-0}" -gt 0 ] &&
        [ "$SWAP_USED_PCT" -ge "$MEM_SWAP_USED_WARN_PCT" ]; }; then
-    mem_alert "memória baixa — ${MEM_STATUS}.
+    mem_alert "low memory — ${MEM_STATUS}.
 top: $(mem_top_groups 5)"
 fi
 
 echo "$new_sys_count" >"$MEM_SYS_COUNT_FILE"
 
-## 4c: relatar kills do earlyoom ##
+## 4c: report earlyoom kills ##
 
-# --cursor-file retoma exatamente de onde a execução anterior parou (sem
-# duplicar nem perder eventos). Sem cursor ainda, olha só o último minuto.
+# --cursor-file resumes exactly where the previous run stopped, without
+# duplicate or missing events. Without a cursor, only read the last minute.
 if command -v journalctl >/dev/null 2>&1 &&
    systemctl is-active --quiet earlyoom 2>/dev/null; then
     eo_args=(--cursor-file="$EARLYOOM_CURSOR_FILE")
@@ -1000,19 +996,19 @@ if command -v journalctl >/dev/null 2>&1 &&
 
     if [ -n "$eo_kills" ]; then
         log "EARLYOOM $(tr '\n' ';' <<<"$eo_kills")"
-        notify "🚨 earlyoom matou processo(s) por falta de memória:
+        notify "🚨 earlyoom killed process(es) due to low memory:
 $(head -n 5 <<<"$eo_kills")
-agora: ${MEM_STATUS}"
+now: ${MEM_STATUS}"
     fi
 fi
 
-### Liberação de throttles de processos que ficaram ociosos ###
+### Release throttles for processes that became idle ###
 #
-# Mede o uso REAL de CPU do alvo entre duas execuções (utime+stime de
-# /proc/<pid>/stat), não o %CPU médio do ps. Sob cpulimit o uso satura no
-# limite; se ficar abaixo de RELEASE_IDLE_PCT% desse limite por
-# RELEASE_SUSTAIN_CHECKS execuções seguidas, o pico acabou e o throttle cai.
-# RELEASE_SUSTAIN_CHECKS=0 desativa.
+# Measure ACTUAL target CPU usage between runs (utime+stime from
+# /proc/<pid>/stat), rather than ps lifetime %CPU. Under cpulimit, usage
+# saturates at the limit. If it stays below RELEASE_IDLE_PCT% of that
+# limit for RELEASE_SUSTAIN_CHECKS consecutive runs, remove the throttle.
+# RELEASE_SUSTAIN_CHECKS=0 disables automatic release.
 
 proc_cpu_ticks() {
     awk '{
@@ -1075,8 +1071,8 @@ release_idle_throttles() {
             fi
             RELEASED["$key"]=1
             printf '%s\t%s\n' "$key" "$(( NOW + grace_min * 60 ))" >>"$GRACE_FILE"
-            log "RELEASE pid=$pid -> throttle removido: uso real abaixo de ${threshold}% por ${sustain} execuções (motivo original: ${reason:-?})"
-            notify "✅ cpu-watchdog: throttle removido do pid $pid (uso real baixo por ${sustain}min)."
+            log "RELEASE pid=$pid -> throttle removed: actual usage below ${threshold}% for ${sustain} runs (original reason: ${reason:-?})"
+            notify "✅ cpu-watchdog: throttle removed from pid $pid (low actual usage for ${sustain}min)."
         else
             printf '%s\t%s\t%s\t%s\n' "$key" "$ticks" "$NOW" "$idle" >>"${RELEASE_FILE}.new"
         fi
@@ -1095,7 +1091,7 @@ while IFS=$'\t' read -r key until_epoch; do
 done <"$GRACE_FILE"
 mv "${GRACE_FILE}.new" "$GRACE_FILE"
 
-### Limpeza de estados antigos ###
+### Clean up old state ###
 
 : >"${LIMITED_FILE}.new"
 
@@ -1111,7 +1107,7 @@ while IFS=$'\t' read -r key cpulimit_pid limit applied_at reason; do
         continue
     fi
 
-    # Mantém apenas se o processo alvo e o cpulimit ainda existem.
+    # Keep entries only if both the target and cpulimit processes still exist.
     if [ -d "$PROC_DIR/$pid" ] &&
        [ -n "${cpulimit_pid:-}" ] &&
        [ -d "$PROC_DIR/$cpulimit_pid" ]; then

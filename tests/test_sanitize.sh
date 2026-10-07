@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Segredos no argv de processos monitorados não podem chegar ao log local nem
-# ao journal (logger). A cmdline continua útil para diagnóstico.
+# Secrets in monitored process argv must not reach the local log or
+# journal (logger). Preserve useful command-line details for diagnostics.
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -8,8 +8,8 @@ ACT_NOW='SUSTAIN_CHECKS=1
 AGG_SUSTAIN_CHECKS=99
 FORKBOMB_SUSTAIN_CHECKS=99'
 
-# Dispara a Camada 1 contra uma vítima com os argumentos dados e devolve
-# log + journal concatenados.
+# Trigger Layer 1 against a victim with the supplied arguments and return
+# the concatenated log and journal.
 throttle_output() {
     EXTRA_CONF="$ACT_NOW" write_conf
     local p; p=$(spawn_victim "$@"); link_proc "$p"
@@ -23,7 +23,7 @@ assert_redacted() {
     local out="$1"; shift
     local s
     for s in "$@"; do
-        assert_not_contains "$out" "$s" "(segredo vazou)"
+        assert_not_contains "$out" "$s" "(secret leaked)"
     done
     assert_contains "$out" "<redacted>"
 }
@@ -116,7 +116,7 @@ FORKBOMB_SUSTAIN_CHECKS=1' write_conf
     done
     run_watchdog
     local out; out="$(log_content)$(calls logger)"
-    assert_contains "$out" "FORKBOMB 3 processos"
+    assert_contains "$out" "FORKBOMB 3 identical processes"
     assert_redacted "$out" FBx999
 }
 
@@ -155,7 +155,7 @@ test_huge_cmdline_is_truncated() {
     ps_cpu "$p" 99 app
     run_watchdog
     local line; line=$(grep THROTTLE "$T/watchdog.log")
-    [ "${#line}" -lt 1500 ] || fail "linha de log com ${#line} caracteres"
+    [ "${#line}" -lt 1500 ] || fail "log line contains ${#line} characters"
     assert_contains "$line" "…]"
 }
 
@@ -229,7 +229,7 @@ test_huge_number_of_args_is_bounded() {
     ps_cpu "$p" 99 app
     local start=$SECONDS
     run_watchdog
-    [ $((SECONDS - start)) -le 3 ] || fail "watchdog levou $((SECONDS - start))s com 100k argumentos"
+    [ $((SECONDS - start)) -le 3 ] || fail "watchdog took $((SECONDS - start))s with 100k arguments"
     assert_contains "$(log_content)" "…]"
 }
 
@@ -239,8 +239,8 @@ test_log_and_state_are_private() {
     local p; p=$(spawn_victim); link_proc "$p"
     ps_cpu "$p" 99 app
     (umask 022; run_watchdog)
-    assert_eq 600 "$(stat -c %a "$T/watchdog.log")" "(modo do log)"
-    assert_eq 700 "$(stat -c %a "$T/state")" "(modo do STATE_DIR)"
+    assert_eq 600 "$(stat -c %a "$T/watchdog.log")" "(log permissions)"
+    assert_eq 700 "$(stat -c %a "$T/state")" "(STATE_DIR permissions)"
 }
 
 run_test test_leak_reproduction_flag_with_equals

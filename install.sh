@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Instala/atualiza o cpu-watchdog a partir deste repo.
-# Idempotente: rodar de novo depois de mudar bin/systemd/config aplica só o
-# que mudou (compara por conteúdo) e recarrega o systemd quando necessário.
-# O /etc/cpu-watchdog.conf já instalado NUNCA é sobrescrito automaticamente
-# (pode ter tokens de Telegram e thresholds ajustados manualmente).
+# Install/update cpu-watchdog from this repository.
+# Idempotent: after bin/systemd/config changes, rerunning only applies
+# changed content and reloads systemd when needed.
+# An installed /etc/cpu-watchdog.conf is NEVER automatically overwritten
+# (it may contain Telegram tokens and manually adjusted thresholds).
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "Rode como root (sudo ./install.sh)" >&2
+    echo "Run as root (sudo ./install.sh)" >&2
     exit 1
 fi
 
@@ -17,11 +17,11 @@ CHANGED=0
 install_if_changed() {
     local src="$1" dest="$2" mode="${3:-644}"
     if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
-        echo "  sem mudança: $dest"
+        echo "  unchanged: $dest"
         return 0
     fi
     install -D -m "$mode" "$src" "$dest"
-    echo "  atualizado:  $dest"
+    echo "  updated:  $dest"
     CHANGED=1
 }
 
@@ -71,24 +71,24 @@ else
     esac
 fi
 
-echo "==> Script principal"
+echo "==> Main script"
 install_if_changed "$REPO_DIR/bin/cpu-watchdog.sh" /usr/local/bin/cpu-watchdog.sh 755
 
-echo "==> Ferramenta de gerenciamento (status/log/unthrottle/whitelist)"
+echo "==> Management tool (status/log/unthrottle/whitelist)"
 install_if_changed "$REPO_DIR/bin/cpu-watchdog-ctl.sh" /usr/local/bin/cpu-watchdog-ctl 755
 
-echo "==> Unidades systemd"
+echo "==> systemd units"
 install_if_changed "$REPO_DIR/systemd/cpu-watchdog.service" /etc/systemd/system/cpu-watchdog.service
 install_if_changed "$REPO_DIR/systemd/cpu-watchdog.timer" /etc/systemd/system/cpu-watchdog.timer
 
-echo "==> earlyoom (Camada 4: picos súbitos de memória)"
+echo "==> earlyoom (Layer 4: sudden memory spikes)"
 EARLYOOM_CHANGED=0
 if ! cmp -s "$REPO_DIR/config/earlyoom.default" /etc/default/earlyoom; then
     install -m 644 "$REPO_DIR/config/earlyoom.default" /etc/default/earlyoom
-    echo "  atualizado:  /etc/default/earlyoom"
+    echo "  updated:  /etc/default/earlyoom"
     EARLYOOM_CHANGED=1
 else
-    echo "  sem mudança: /etc/default/earlyoom"
+    echo "  unchanged: /etc/default/earlyoom"
 fi
 systemctl enable --now earlyoom >/dev/null 2>&1
 if [ "$EARLYOOM_CHANGED" -eq 1 ]; then
@@ -97,7 +97,7 @@ fi
 
 if systemctl cat tailscaled.service >/dev/null 2>&1; then
     install_if_changed "$REPO_DIR/systemd/tailscaled-oom.conf" /etc/systemd/system/tailscaled.service.d/oom.conf
-    # Aplica ao vivo sem reiniciar o tailscaled (derrubaria o acesso remoto).
+    # Apply live without restarting tailscaled, which would interrupt remote access.
     for p in $(pgrep -x tailscaled || true); do
         choom -p "$p" -n -900 >/dev/null 2>&1 || true
     done
@@ -106,21 +106,21 @@ fi
 echo "==> Config"
 if [ ! -f /etc/cpu-watchdog.conf ]; then
     install -D -m 600 "$REPO_DIR/config/cpu-watchdog.conf.example" /etc/cpu-watchdog.conf
-    echo "  criado: /etc/cpu-watchdog.conf a partir do template"
+    echo "  created: /etc/cpu-watchdog.conf from template"
     CHANGED=1
 elif cmp -s "$REPO_DIR/config/cpu-watchdog.conf.example" /etc/cpu-watchdog.conf; then
-    echo "  /etc/cpu-watchdog.conf ok (igual ao template do repo)"
+    echo "  /etc/cpu-watchdog.conf ok (matches repository template)"
 else
-    chmod 600 /etc/cpu-watchdog.conf  # tem token do Telegram
-    echo "  /etc/cpu-watchdog.conf já existe e está customizado — não sobrescrevendo."
-    echo "  diferenças em relação ao template (valores sensíveis mascarados):"
-    # Nunca imprimir valores de TOKEN/CHAT_ID/SECRET/PASSWORD/API_KEY em texto puro —
-    # eles vivem só em /etc/cpu-watchdog.conf, nunca no repo nem em stdout.
+    chmod 600 /etc/cpu-watchdog.conf  # contains a Telegram token
+    echo "  /etc/cpu-watchdog.conf already exists and is customized — keeping it."
+    echo "  differences from template (sensitive values redacted):"
+    # Never print TOKEN/CHAT_ID/SECRET/PASSWORD/API_KEY values in plain text.
+    # They belong only in /etc/cpu-watchdog.conf, never the repository or stdout.
     redact() { sed -E 's/^([A-Z_]*(TOKEN|SECRET|PASSWORD|CHAT_ID|API_KEY)=).*/\1"<redacted>"/' "$1"; }
     diff -u <(redact /etc/cpu-watchdog.conf) <(redact "$REPO_DIR/config/cpu-watchdog.conf.example") || true
 fi
 
-echo "==> Estado"
+echo "==> State"
 mkdir -p /var/lib/cpu-watchdog
 touch /var/lib/cpu-watchdog/counts.tsv /var/lib/cpu-watchdog/limited.tsv
 
@@ -131,25 +131,25 @@ fi
 systemctl enable --now cpu-watchdog.timer
 if [ "$CHANGED" -eq 1 ]; then
     systemctl restart cpu-watchdog.timer
-    echo "  timer recarregado (havia mudanças)"
+    echo "  timer reloaded (changes detected)"
 fi
 
 echo
-echo "==> Resumo"
+echo "==> Summary"
 (
     # shellcheck disable=SC1091
     source /etc/cpu-watchdog.conf
     echo "  Config:                   /etc/cpu-watchdog.conf"
-    echo "  Camada 1 (processo único): ${CPU_THRESHOLD}% CPU por ${SUSTAIN_CHECKS}min -> throttle a ${LIMIT_PERCENT}%"
-    echo "  Camada 2 (uso agregado):   ${AGG_CPU_THRESHOLD_PCT}% da capacidade total por ${AGG_SUSTAIN_CHECKS}min -> throttle top ${AGG_TOP_N} a ${AGG_LIMIT_PERCENT}%"
-    echo "  Camada 4 (memória):        processo >= ${MEM_PROC_KILL_MB:-?}MB por ${MEM_PROC_SUSTAIN_CHECKS:-?}min -> SIGTERM; RAM livre <= ${MEM_AVAIL_KILL_PCT:-?}% e swap livre <= ${MEM_SWAP_FREE_KILL_PCT:-?}% por ${MEM_SYS_SUSTAIN_CHECKS:-?}min -> SIGTERM no maior; earlyoom $(systemctl is-active earlyoom)"
+    echo "  Layer 1 (single process): ${CPU_THRESHOLD}% CPU for ${SUSTAIN_CHECKS}min -> throttle to ${LIMIT_PERCENT}%"
+    echo "  Layer 2 (aggregate usage):   ${AGG_CPU_THRESHOLD_PCT}% of total capacity for ${AGG_SUSTAIN_CHECKS}min -> throttle top ${AGG_TOP_N} to ${AGG_LIMIT_PERCENT}%"
+    echo "  Layer 4 (memory):        process >= ${MEM_PROC_KILL_MB:-?}MB for ${MEM_PROC_SUSTAIN_CHECKS:-?}min -> SIGTERM; available RAM <= ${MEM_AVAIL_KILL_PCT:-?}% and free swap <= ${MEM_SWAP_FREE_KILL_PCT:-?}% for ${MEM_SYS_SUSTAIN_CHECKS:-?}min -> SIGTERM to largest; earlyoom $(systemctl is-active earlyoom)"
     if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        echo "  Telegram:                 ativado"
+        echo "  Telegram:                 enabled"
     else
-        echo "  Telegram:                 desativado (edite TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID em /etc/cpu-watchdog.conf pra ativar)"
+        echo "  Telegram:                 disabled (edit TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID in /etc/cpu-watchdog.conf to enable)"
     fi
-    echo "  Editar:                   sudo \$EDITOR /etc/cpu-watchdog.conf   (não precisa reiniciar nada, o timer lê o arquivo a cada execução)"
-    echo "  Ver/gerenciar:            sudo cpu-watchdog-ctl   (menu interativo: ver o que está limitado, liberar, colocar na whitelist)"
+    echo "  Edit:                   sudo \$EDITOR /etc/cpu-watchdog.conf   (no restart needed; the timer reads the file on every run)"
+    echo "  View/manage:            sudo cpu-watchdog-ctl   (interactive menu: view throttles, release, whitelist)"
 )
 
 echo

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Camada 4: memória (4a processo único, 4b pressão da máquina, 4c earlyoom).
-# spawn_victim sem argumentos é intencional (vítima genérica).
+# Layer 4: memory (4a single process, 4b host pressure, 4c earlyoom).
+# Calling spawn_victim without arguments is intentional (generic victim).
 # shellcheck disable=SC2119
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -11,7 +11,7 @@ test_large_process_termed_after_sustain() {
     local p; p=$(spawn_victim); link_proc "$p"
     ps_mem "$p" $((5000 * MB)) leaky
     run_watchdog || fail "exit != 0: $(cat "$T/stderr")"
-    assert_alive "$p" "(1ª medição)"
+    assert_alive "$p" "(first measurement)"
     run_watchdog
     assert_dead "$p"
     assert_contains "$(log_content)" "MEM_PROC 5000MB >= 4096MB"
@@ -22,10 +22,10 @@ test_process_ignoring_term_gets_kill_next_run() {
     local p; p=$(spawn_stubborn_victim); link_proc "$p"
     ps_mem "$p" $((5000 * MB)) stubborn
     run_watchdog; run_watchdog
-    assert_alive "$p" "(ignorou SIGTERM)"
+    assert_alive "$p" "(ignored SIGTERM)"
     run_watchdog
     assert_dead "$p"
-    assert_contains "$(log_content)" "MEM_PROC ignorou SIGTERM"
+    assert_contains "$(log_content)" "MEM_PROC ignored SIGTERM"
     assert_contains "$(log_content)" "SIGKILL"
 }
 
@@ -58,10 +58,10 @@ test_system_pressure_kills_one_preferred_process() {
     ps_mem "$big" $((900 * MB)) bigapp
     ps_mem "$pref" $((300 * MB)) prefer-me
     run_watchdog
-    assert_alive "$pref" "(1ª medição)"
+    assert_alive "$pref" "(first measurement)"
     run_watchdog
     assert_dead "$pref"
-    assert_alive "$big" "(só uma vítima por vez)"
+    assert_alive "$big" "(only one victim at a time)"
     assert_contains "$(log_content)" "MEM_SYS_HIGH"
 }
 
@@ -75,7 +75,7 @@ test_test_tooling_killed_before_preferred_agent() {
     ps_mem "$vite" $((300 * MB)) node
     run_watchdog; run_watchdog
     assert_dead "$vite"
-    assert_alive "$agent" "(agente só depois das ferramentas de teste)"
+    assert_alive "$agent" "(agent only after test tools)"
 }
 
 test_preferred_agent_still_killed_when_no_test_tooling_left() {

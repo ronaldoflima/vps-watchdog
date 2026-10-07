@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Camadas 1 e 2: throttle por CPU.
+# Layers 1 and 2: CPU throttling.
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -7,7 +7,7 @@ test_single_process_throttled_after_sustain_checks() {
     local p; p=$(spawn_victim); link_proc "$p"
     ps_cpu "$p" 95 hog
     run_watchdog || fail "exit != 0: $(cat "$T/stderr")"
-    assert_eq "" "$(calls cpulimit)" "(não deve agir na 1ª medição)"
+    assert_eq "" "$(calls cpulimit)" "(should not act on the first measurement)"
     run_watchdog || fail "exit != 0: $(cat "$T/stderr")"
     assert_contains "$(calls cpulimit)" "-p $p -l 50 -z"
     assert_contains "$(log_content)" "THROTTLE cpu=95%"
@@ -61,8 +61,8 @@ test_whitelisted_cmdline_never_throttled() {
     assert_eq "" "$(calls cpulimit)"
 }
 
-# Camada 2 mede o uso real: 4 CPUs (stub de nproc) x 100 Hz x 60 s = 24000 ticks
-# por intervalo entre execuções. 19200 de busy = 80% da capacidade (limite: 75%).
+# Layer 2 measures actual usage: 4 CPUs (nproc stub) x 100 Hz x 60 s = 24000
+# ticks per interval. 19200 busy ticks = 80% of capacity (threshold: 75%).
 agg_busy() { advance_cpu 19200 4800; }
 agg_calm() { advance_cpu 1200 22800; }
 
@@ -85,7 +85,7 @@ test_aggregate_real_load_throttles_recent_top_consumers_up_to_limit() {
     agg_busy
     fake_proc "$a" w1 1000; fake_proc "$b" w2 6000; fake_proc "$c" w3 5000; fake_proc "$d" w4 4000
     run_watchdog
-    assert_eq "" "$(calls cpulimit)" "(só 1 intervalo acima do limite)"
+    assert_eq "" "$(calls cpulimit)" "(only one interval above the threshold)"
     agg_busy
     fake_proc "$a" w1 2000; fake_proc "$b" w2 12000; fake_proc "$c" w3 10000; fake_proc "$d" w4 8000
     run_watchdog
@@ -95,7 +95,7 @@ test_aggregate_real_load_throttles_recent_top_consumers_up_to_limit() {
     assert_contains "$cl" "-p $c -l 20"
     assert_not_contains "$cl" "-p $a "
     assert_not_contains "$cl" "-p $d "
-    assert_contains "$(log_content)" "AGG_HIGH uso agregado 320%"
+    assert_contains "$(log_content)" "AGG_HIGH aggregate usage 320%"
 }
 
 test_aggregate_below_threshold_does_nothing() {
@@ -189,7 +189,7 @@ test_aggregate_counter_reset_does_not_fire_or_crash() {
     fake_proc "$hog" hog 0
     advance_cpu 1000000 1000000; run_watchdog
     printf 'cpu  5 0 0 5 0 0 0 0 0 0\n' >"$T/proc/stat"
-    run_watchdog || fail "exit != 0 com contador regredindo: $(cat "$T/stderr")"
+    run_watchdog || fail "exit != 0 with a regressed counter: $(cat "$T/stderr")"
     assert_eq "" "$(cat "$T/stderr")"
     assert_eq "" "$(calls cpulimit)"
     CPU_USER=5; CPU_IDLE=5
@@ -208,7 +208,7 @@ test_aggregate_handles_comm_with_spaces_and_parentheses() {
         agg_busy; fake_proc "$hog" "my (odd) name" $((i * 6000)); run_watchdog
     done
     assert_contains "$(calls cpulimit)" "-p $hog -l 20"
-    assert_contains "$(log_content)" "comm=my (odd) name -> limitado"
+    assert_contains "$(log_content)" "comm=my (odd) name -> limited"
 }
 
 test_aggregate_sanitizes_control_chars_in_comm_and_keeps_process_visible() {
@@ -220,19 +220,19 @@ test_aggregate_sanitizes_control_chars_in_comm_and_keeps_process_visible() {
         agg_busy; fake_proc "$hog" $'evil)\n7 (x\t\033[31m' $((i * 6000)); run_watchdog
     done
     assert_contains "$(calls cpulimit)" "-p $hog -l 20"
-    assert_contains "$(log_content)" "comm=evil)?7 (x??[31m -> limitado"
-    assert_not_contains "$(log_content)" $'\033' "(ESC cru no log)"
+    assert_contains "$(log_content)" "comm=evil)?7 (x??[31m -> limited"
+    assert_not_contains "$(log_content)" $'\033' "(raw ESC in log)"
 }
 
 test_aggregate_ignores_corrupt_sample_file() {
     local hog
     hog=$(spawn_victim hog)
     fake_proc "$hog" hog 0
-    printf 'lixo\nsem formato\n' >"$T/state/agg_sample.tsv"
-    advance_cpu 1000 1000; run_watchdog || fail "exit != 0 com amostra corrompida: $(cat "$T/stderr")"
+    printf 'garbage\nunformatted\n' >"$T/state/agg_sample.tsv"
+    advance_cpu 1000 1000; run_watchdog || fail "exit != 0 with a corrupt sample: $(cat "$T/stderr")"
     assert_eq "" "$(cat "$T/stderr")"
     assert_eq "" "$(calls cpulimit)"
-    assert_eq "2" "$(head -1 "$T/state/agg_sample.tsv" | awk -F'\t' '{ print NF }')" "(amostra regravada)"
+    assert_eq "2" "$(head -1 "$T/state/agg_sample.tsv" | awk -F'\t' '{ print NF }')" "(sample rewritten)"
 }
 
 test_aggregate_high_without_candidates_logs_and_does_nothing() {
@@ -246,7 +246,7 @@ test_aggregate_high_without_candidates_logs_and_does_nothing() {
         run_watchdog
     done
     assert_eq "" "$(calls cpulimit)"
-    assert_contains "$(log_content)" "AGG_HIGH nenhum processo acima de 20%"
+    assert_contains "$(log_content)" "AGG_HIGH no process above 20%"
 }
 
 test_cpulimit_does_not_hold_watchdog_lock() {
@@ -254,7 +254,7 @@ test_cpulimit_does_not_hold_watchdog_lock() {
     ps_cpu "$p" 95 hog
     run_watchdog; run_watchdog
     assert_contains "$(calls cpulimit)" "-p $p -l 50 -z"
-    flock -n "$T/lock" true || fail "cpulimit vivo segurando o flock do watchdog"
+    flock -n "$T/lock" true || fail "running cpulimit holds the watchdog flock"
 }
 
 test_idle_throttled_process_is_released_and_not_relimited() {
@@ -264,12 +264,12 @@ test_idle_throttled_process_is_released_and_not_relimited() {
     run_watchdog; run_watchdog
     assert_contains "$(calls cpulimit)" "-p $p -l 50 -z"
     run_watchdog
-    assert_eq "" "$(log_content | grep RELEASE || true)" "(1 medição ociosa de 2)"
+    assert_eq "" "$(log_content | grep RELEASE || true)" "(one idle measurement out of two)"
     run_watchdog
     assert_contains "$(log_content)" "RELEASE pid=$p"
     assert_contains "$(calls systemctl)" "stop cpu-watchdog-limit-${p}-"
     run_watchdog; run_watchdog
-    assert_eq 1 "$(calls cpulimit | wc -l)" "(grace impede novo throttle)"
+    assert_eq 1 "$(calls cpulimit | wc -l)" "(grace period prevents rethrottling)"
 }
 
 test_release_disabled_keeps_throttle() {

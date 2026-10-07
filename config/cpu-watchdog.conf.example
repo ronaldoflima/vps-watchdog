@@ -1,116 +1,116 @@
-# Configuração do cpu-watchdog
-# CPU_THRESHOLD: %CPU (base de 1 core, valor do "ps -o %cpu") acima do qual um processo
-#                começa a ser contado como "consumindo demais".
+# cpu-watchdog configuration
+# CPU_THRESHOLD: %CPU relative to one core (ps -o %cpu), above which a
+#                process is counted as consuming too much CPU.
 CPU_THRESHOLD=80
 
-# SUSTAIN_CHECKS: quantas verificações consecutivas acima do threshold até agir.
-# O timer roda a cada 1 minuto, então 5 = 5 minutos sustentados.
+# SUSTAIN_CHECKS: consecutive checks above the threshold before taking action.
+# The timer runs every minute, so 5 means 5 sustained minutes.
 SUSTAIN_CHECKS=5
 
-# LIMIT_PERCENT: teto de CPU aplicado via cpulimit quando o processo estoura o limite.
+# LIMIT_PERCENT: CPU cap applied by cpulimit when a process exceeds the threshold.
 LIMIT_PERCENT=50
 
-# Obs.: comm é truncado em 15 caracteres pelo kernel (ex.: systemd-journald
-# aparece como "systemd-journal"), então use o nome como o `ps -o comm` mostra.
-# Comandos que NUNCA devem ser throttled/mortos pelas camadas de CPU (1–3),
-# mesmo que estourem o limite (infraestrutura essencial do próprio
-# sistema/acesso remoto). "claude" e "codex" são CLIs de agentes de IA (Claude Code, Codex): sessões interativas
-# de agentes de IA que fazem picos longos de CPU legítimos — troque pelos
-# seus processos equivalentes ou remova.
+# The kernel truncates comm to 15 characters (e.g. systemd-journald becomes
+# "systemd-journal"). Use the name shown by ps -o comm.
+# Commands NEVER throttled/killed by CPU layers (1–3), even above the
+# threshold (essential infrastructure and remote access). "claude" and
+# "codex" are AI agent CLIs (Claude Code, Codex) whose interactive sessions
+# can legitimately sustain long CPU spikes. Replace with your equivalent
+# processes or remove them.
 WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn earlyoom dbus-daemon cron crond atop cpulimit cpu-watchdog.sh ps claude codex"
 
-# Whitelist por LINHA DE COMANDO completa (/proc/<pid>/cmdline), regex ERE.
-# Use quando o comm for genérico demais (ex.: "python", "node"), já que
-# WHITELIST_COMM isentaria TODOS os processos com aquele nome.
-# Vazio = desativado. Vários padrões: separe com "|". Exemplo (um job batch
-# em Python e um worker Celery que podem usar CPU cheia por horas):
+# Whitelist by FULL command line (/proc/<pid>/cmdline), using an ERE regex.
+# Use when comm is too generic (e.g. "python", "node"), because WHITELIST_COMM
+# would exempt ALL processes with that name.
+# Empty = disabled. Separate multiple patterns with "|". Example for a
+# Python batch job and Celery worker allowed to use full CPU for hours:
 #   WHITELIST_CMDLINE="python3 -m myapp\\.batch|celery .*worker"
 WHITELIST_CMDLINE=""
 
-# --- Alertas via Telegram (opcional) ---
-# Preencha para receber notificação a cada ação de throttle. Deixe em branco para
-# apenas logar em /var/log/cpu-watchdog.log e no journal (journalctl -u cpu-watchdog).
-# Este arquivo passa a conter segredo: mantenha-o root:root com modo 600.
+# --- Telegram alerts (optional) ---
+# Set these to receive notifications for throttle actions. Leave empty to
+# only log to /var/log/cpu-watchdog.log and the journal (journalctl -u cpu-watchdog).
+# This file contains secrets: keep ownership root:root and mode 600.
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 
 STATE_DIR="/var/lib/cpu-watchdog"
 LOG_FILE="/var/log/cpu-watchdog.log"
 
-# --- Camada 2: uso agregado da máquina ---
-# Cobre o caso de vários processos moderados (ex.: 10 processos a 30% cada)
-# que juntos pressionam a VPS mas nenhum sozinho cruza o CPU_THRESHOLD acima.
-# Mede o uso real entre duas execuções (/proc/stat), sem contar idle, iowait
-# nem steal.
+# --- Layer 2: aggregate host usage ---
+# Handles multiple moderately busy processes (e.g. 10 processes at 30% each)
+# that overload the VPS together without any one crossing CPU_THRESHOLD.
+# Measures actual usage between runs (/proc/stat), excluding idle, iowait
+# and steal.
 
-# AGG_CPU_THRESHOLD_PCT: % da capacidade TOTAL da máquina (nproc * 100).
-# Em 4 vCPUs, 75 = 300% de uso somado entre todos os processos.
+# AGG_CPU_THRESHOLD_PCT: percentage of TOTAL host capacity (nproc * 100).
+# On 4 vCPUs, 75 means 300% usage summed across all processes.
 AGG_CPU_THRESHOLD_PCT=75
 
-# AGG_SUSTAIN_CHECKS: minutos seguidos com uso agregado acima do limite até agir.
+# AGG_SUSTAIN_CHECKS: consecutive minutes above the aggregate threshold before acting.
 AGG_SUSTAIN_CHECKS=5
 
-# Quando dispara: throttle nos AGG_TOP_N processos que mais consumiram CPU no
-# último minuto (excluindo whitelist e kernel threads), cada um limitado a
-# AGG_LIMIT_PERCENT. Só entra quem usou mais que AGG_LIMIT_PERCENT.
+# When triggered: throttle the AGG_TOP_N top CPU consumers from the last
+# minute (excluding whitelisted processes and kernel threads), each capped
+# at AGG_LIMIT_PERCENT. Only include usage above AGG_LIMIT_PERCENT.
 AGG_TOP_N=5
 AGG_MAX_THROTTLES=5
 AGG_LIMIT_PERCENT=20
 
-# --- Liberação automática de throttle ---
-# Mede o uso REAL do processo limitado (utime+stime entre execuções). Sob
-# cpulimit o uso satura no limite; se ficar abaixo de RELEASE_IDLE_PCT% do
-# limite por RELEASE_SUSTAIN_CHECKS minutos seguidos, o throttle é removido.
-# 0 desativa (o throttle só cai quando o processo morre ou via
-# `cpu-watchdog-ctl unthrottle`).
+# --- Automatic throttle release ---
+# Measure ACTUAL throttled process usage (utime+stime between runs). Under
+# cpulimit, usage saturates at the limit. If below RELEASE_IDLE_PCT% of
+# that limit for RELEASE_SUSTAIN_CHECKS consecutive minutes, remove throttling.
+# 0 disables release (throttling ends only when the process exits or through
+# cpu-watchdog-ctl unthrottle).
 RELEASE_SUSTAIN_CHECKS=3
 RELEASE_IDLE_PCT=50
-# Após liberar, o processo fica isento de novo throttle por este tempo (o %CPU
-# do ps é média de vida e continuaria alto, re-limitando o processo à toa).
+# After release, exempt the process for this many minutes (ps %CPU is a
+# lifetime average that could otherwise trigger unnecessary throttling again).
 RELEASE_GRACE_MIN=30
 
-# --- Camada 3: fork bomb (várias cópias idênticas do mesmo comando) ---
+# --- Layer 3: fork bomb (identical copies of the same command) ---
 FORKBOMB_MIN_COUNT=3
 FORKBOMB_SUSTAIN_CHECKS=3
 
-# --- Camada 4: memória ---
-# Picos súbitos são tratados pelo earlyoom (/etc/default/earlyoom), que reage
-# em ~1s; esta camada roda a cada minuto e cobre vazamento lento e pressão
-# sustentada. Valores de RAM em MB, porcentagens sobre o total da máquina.
+# --- Layer 4: memory ---
+# earlyoom (/etc/default/earlyoom) handles sudden spikes, reacting in ~1s.
+# This layer runs every minute, covering slow leaks and sustained pressure.
+# RAM values are in MB; percentages are relative to host totals.
 
-# 4a. Processo único com RSS >= MEM_PROC_KILL_MB por MEM_PROC_SUSTAIN_CHECKS
-#     minutos -> SIGTERM (e SIGKILL na execução seguinte se ignorar).
+# 4a. Single process with RSS >= MEM_PROC_KILL_MB for MEM_PROC_SUSTAIN_CHECKS
+#     minutes -> SIGTERM (then SIGKILL on the next run if ignored).
 MEM_PROC_KILL_MB=4096
 MEM_PROC_SUSTAIN_CHECKS=3
 
-# 4b. Máquina toda: alerta (Telegram, com cooldown) quando a RAM disponível
-#     cai a MEM_AVAIL_WARN_PCT ou o swap passa de MEM_SWAP_USED_WARN_PCT.
+# 4b. Host-wide: alert via Telegram with a cooldown when available RAM
+#     drops to MEM_AVAIL_WARN_PCT or swap usage exceeds MEM_SWAP_USED_WARN_PCT.
 MEM_AVAIL_WARN_PCT=20
 MEM_SWAP_USED_WARN_PCT=50
 MEM_ALERT_COOLDOWN_MIN=30
 
-#     Age quando RAM disponível <= MEM_AVAIL_KILL_PCT E swap livre
-#     <= MEM_SWAP_FREE_KILL_PCT por MEM_SYS_SUSTAIN_CHECKS minutos: SIGTERM no
-#     maior processo (>= MEM_VICTIM_MIN_MB), priorizando MEM_PREFER_REGEX.
-#     Um por vez; o contador zera após cada kill.
+#     Act when available RAM <= MEM_AVAIL_KILL_PCT AND free swap
+#     <= MEM_SWAP_FREE_KILL_PCT for MEM_SYS_SUSTAIN_CHECKS minutes: SIGTERM
+#     to the largest process (>= MEM_VICTIM_MIN_MB), prioritizing MEM_PREFER_REGEX.
+#     One at a time; reset the counter after each kill.
 MEM_AVAIL_KILL_PCT=10
 MEM_SWAP_FREE_KILL_PCT=40
 MEM_SYS_SUSTAIN_CHECKS=2
 MEM_VICTIM_MIN_MB=200
 
-# Regex ERE contra o comm. Use [.] em vez de \. (vai pro awk via -v).
-# Os padrões abaixo miram o que costuma inflar memória numa VPS de
-# desenvolvimento: sessões Claude Code, node, php, chrome headless.
-# [0-9]+[.][0-9]+[.][0-9]+ = binário versionado do Claude Code (ex.: 2.1.283).
+# ERE regex against comm. Use [.] instead of \. (passed to awk through -v).
+# These patterns target common memory consumers on development VPS hosts:
+# Claude Code sessions, node, php and headless chrome.
+# [0-9]+[.][0-9]+[.][0-9]+ = versioned Claude Code binary (e.g. 2.1.283).
 MEM_PREFER_REGEX="^(claude|node|php|php8[.]3|chrome|chrome-devtools|[0-9]+[.][0-9]+[.][0-9]+)$"
 
-# Morrem ANTES dos que casam MEM_PREFER_REGEX: processos descartáveis que os
-# agentes sobem para testar/buildar. Regex ERE contra a LINHA DE COMANDO
-# completa, porque vite/jest aparecem como "node" e phpunit como "php" no comm.
-# Vazio = desativado (só MEM_PREFER_REGEX vale).
+# Terminate BEFORE matches of MEM_PREFER_REGEX: disposable processes
+# launched by agents for testing/building. ERE regex against the FULL
+# command line, because vite/jest appear as "node" and phpunit as "php" in comm.
+# Empty = disabled (only MEM_PREFER_REGEX applies).
 MEM_PREFER_FIRST_REGEX="node_modules/[.]bin/(vite|vitest|jest|webpack|playwright|tsc|esbuild)|vendor/bin/(phpunit|pest|paratest)|artisan (test|dusk)|--headless"
 
-# Nunca mortos pela camada de memória. Diferente da WHITELIST_COMM: "claude"
-# NÃO está aqui (isento de throttle de CPU, mas pode morrer por memória).
-# WHITELIST_CMDLINE também vale aqui.
+# Never killed by the memory layer. Unlike WHITELIST_COMM, "claude" is
+# NOT included (exempt from CPU throttling but eligible for memory kills).
+# WHITELIST_CMDLINE also applies here.
 MEM_WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn systemd-network dbus-daemon cron crond atop cpulimit cpu-watchdog.sh ps earlyoom dockerd containerd containerd-shim docker-proxy postgres qdrant ollama tailscaled nginx apache2 php-fpm8.3 php-fpm supervisord s6-supervise fail2ban-server agetty"
