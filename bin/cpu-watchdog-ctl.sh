@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# CLI de gerenciamento do cpu-watchdog: ver o que está sendo limitado e agir,
-# sem precisar saber de cor os caminhos de arquivo nem comandos de systemd.
+# cpu-watchdog management CLI: inspect throttles and take action
+# without memorizing file paths or systemd commands.
 #
-# Uso:
-#   cpu-watchdog-ctl                          menu interativo
-#   cpu-watchdog-ctl status                   o que está limitado agora + snapshot da máquina
-#   cpu-watchdog-ctl log [N]                   últimas N linhas do log (default 40)
-#   cpu-watchdog-ctl unthrottle <PID|all>      libera throttle(s) ativo(s)
-#   cpu-watchdog-ctl whitelist-cpu <comm>      nunca mais limitar esse processo por CPU
-#   cpu-watchdog-ctl whitelist-mem <comm>      nunca mais matar esse processo por memória
-#   cpu-watchdog-ctl whitelist-cmdline <regex> idem, casando pela linha de comando completa
+# Usage:
+#   cpu-watchdog-ctl                          interactive menu
+#   cpu-watchdog-ctl status                   active throttles + host snapshot
+#   cpu-watchdog-ctl log [N]                   last N log lines (default 40)
+#   cpu-watchdog-ctl unthrottle <PID|all>      release active throttle(s)
+#   cpu-watchdog-ctl whitelist-cpu <comm>      exempt a process from CPU throttling
+#   cpu-watchdog-ctl whitelist-mem <comm>      exempt a process from memory kills
+#   cpu-watchdog-ctl whitelist-cmdline <regex> exempt by matching the full command line
 #
-# "comm" = nome como aparece em `ps -o comm` (ex.: qdrant, node, php8.3).
+# "comm" = name shown by ps -o comm (e.g. qdrant, node, php8.3).
 set -euo pipefail
 
 CONF="${CPU_WATCHDOG_CONF:-/etc/cpu-watchdog.conf}"
 STATE_DIR=/var/lib/cpu-watchdog
 LOG_FILE=/var/log/cpu-watchdog.log
 
-# Carrega STATE_DIR/LOG_FILE reais se o config for legível (evita exigir root
-# só para consultar status/log).
+# Load actual STATE_DIR/LOG_FILE if configuration is readable,
+# so status/log queries do not require root.
 if [ -r "$CONF" ]; then
     # shellcheck source=config/cpu-watchdog.conf.example
     source "$CONF"
@@ -29,16 +29,16 @@ LIMITED_FILE="$STATE_DIR/limited.tsv"
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        echo "Isso precisa de root: sudo cpu-watchdog-ctl ${ORIG_ARGS[*]:-}" >&2
+        echo "This requires root: sudo cpu-watchdog-ctl ${ORIG_ARGS[*]:-}" >&2
         exit 1
     fi
 }
 
 usage() {
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-# --- leitura/escrita do config ---
+# --- configuration read/write ---
 
 get_conf_var() {
     local key="$1"
@@ -77,12 +77,12 @@ whitelist_cpu() {
     require_root
     cur="$(get_conf_var WHITELIST_COMM)"
     if list_contains "$comm" "$cur"; then
-        echo "'$comm' já está isento de throttle de CPU (WHITELIST_COMM). Nada a fazer."
+        echo "'$comm' is already exempt from CPU throttling (WHITELIST_COMM). No changes needed."
         return 0
     fi
     set_conf_var WHITELIST_COMM "${cur:+$cur }$comm"
-    echo "OK: '$comm' nunca mais será throttled por CPU (Camadas 1-3)."
-    echo "Não precisa reiniciar nada — o watchdog lê o config a cada execução (1x/min)."
+    echo "OK: '$comm' is now exempt from CPU throttling (Layers 1–3)."
+    echo "No restart needed — the watchdog reads the configuration on every run (once a minute)."
 }
 
 whitelist_mem() {
@@ -90,12 +90,12 @@ whitelist_mem() {
     require_root
     cur="$(get_conf_var MEM_WHITELIST_COMM)"
     if list_contains "$comm" "$cur"; then
-        echo "'$comm' já está isento de kill por memória (MEM_WHITELIST_COMM). Nada a fazer."
+        echo "'$comm' is already exempt from memory kills (MEM_WHITELIST_COMM). No changes needed."
         return 0
     fi
     set_conf_var MEM_WHITELIST_COMM "${cur:+$cur }$comm"
-    echo "OK: '$comm' nunca mais será morto pela Camada 4 (memória)."
-    echo "Não precisa reiniciar nada — o watchdog lê o config a cada execução (1x/min)."
+    echo "OK: '$comm' is now exempt from Layer 4 (memory) kills."
+    echo "No restart needed — the watchdog reads the configuration on every run (once a minute)."
 }
 
 whitelist_cmdline() {
@@ -103,15 +103,15 @@ whitelist_cmdline() {
     require_root
     cur="$(get_conf_var WHITELIST_CMDLINE)"
     if [ -n "$cur" ] && grep -qF -- "$pattern" <<<"$cur"; then
-        echo "Esse padrão já está em WHITELIST_CMDLINE. Nada a fazer."
+        echo "This pattern is already in WHITELIST_CMDLINE. No changes needed."
         return 0
     fi
     set_conf_var WHITELIST_CMDLINE "${cur:+$cur|}$pattern"
-    echo "OK: processos cuja linha de comando casar com '$pattern' nunca mais serão throttled por CPU."
-    echo "Use isso (em vez de whitelist-cpu) quando o nome do processo for genérico (python, node, php)."
+    echo "OK: processes whose command lines match '$pattern' are now exempt from CPU throttling."
+    echo "Use this instead of whitelist-cpu for generic process names (python, node, php)."
 }
 
-# --- consulta / status ---
+# --- queries / status ---
 
 comm_of() {
     local pid="$1"
@@ -119,13 +119,13 @@ comm_of() {
 }
 
 status() {
-    local timer_state="ativo"
-    systemctl is-active --quiet cpu-watchdog.timer 2>/dev/null || timer_state="INATIVO"
+    local timer_state="active"
+    systemctl is-active --quiet cpu-watchdog.timer 2>/dev/null || timer_state="INACTIVE"
 
-    # O que importa primeiro: quem está limitado agora. O resto (log,
-    # snapshot da máquina, timer) é detalhe e vai depois.
+    # Show active throttles first, then details such as log,
+    # host snapshot and timer state.
     echo "########################################"
-    echo "# PROCESSOS LIMITADOS AGORA"
+    echo "# CURRENTLY THROTTLED PROCESSES"
     echo "########################################"
     local any=0
     if [ -f "$LIMITED_FILE" ]; then
@@ -134,34 +134,34 @@ status() {
             local pid="${key%%:*}"
             if [ -n "${cl_pid:-}" ] && kill -0 "$cl_pid" 2>/dev/null; then
                 any=1
-                printf '  >> pid %-8s (%s) limitado a %s%% desde %s\n     motivo: %s\n' \
+                printf '  >> pid %-8s (%s) limited to %s%% since %s\n     reason: %s\n' \
                     "$pid" "$(comm_of "$pid")" "$limit" "$applied_at" "$reason"
             fi
         done <"$LIMITED_FILE"
     fi
     if [ "$any" -eq 0 ]; then
-        echo "  nenhum — nada sendo limitado no momento."
+        echo "  none — no active throttles."
     fi
 
     echo
     echo "----------------------------------------"
-    echo "detalhes"
+    echo "details"
     echo "----------------------------------------"
     echo "timer: $timer_state"
 
     echo
-    echo "-- Últimas 10 linhas do log --"
+    echo "-- Last 10 log lines --"
     if [ -r "$LOG_FILE" ]; then
         tail -n 10 "$LOG_FILE" | sed 's/^/  /'
     else
-        echo "  (sem log ainda, ou sem permissão de leitura — rode com sudo)"
+        echo "  (no log yet, or no read permission — run with sudo)"
     fi
 
     echo
-    echo "-- Snapshot da máquina --"
+    echo "-- Host snapshot --"
     echo "  Top 5 CPU:"
     ps -eo pid,pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -5 | sed 's/^/    /'
-    echo "  Memória:"
+    echo "  Memory:"
     free -h | sed 's/^/    /'
 }
 
@@ -170,27 +170,27 @@ show_log() {
     if [ -r "$LOG_FILE" ]; then
         tail -n "$n" "$LOG_FILE"
     else
-        echo "Não consigo ler $LOG_FILE (rode com sudo)." >&2
+        echo "Cannot read $LOG_FILE (run with sudo)." >&2
         exit 1
     fi
 }
 
-# --- ação ---
+# --- actions ---
 
 unthrottle_one() {
     local pid="$1" cl_pid="$2" key="$3"
     local scope="cpu-watchdog-limit-${key/:/-}.scope"
 
     if systemctl stop "$scope" >/dev/null 2>&1; then
-        echo "Throttle removido: pid $pid ($scope parado)."
+        echo "Throttle removed: pid $pid ($scope stopped)."
         return 0
     fi
 
     if kill -0 "$cl_pid" 2>/dev/null; then
         kill "$cl_pid" 2>/dev/null || true
-        echo "Throttle removido: pid $pid (cpulimit pid $cl_pid morto)."
+        echo "Throttle removed: pid $pid (cpulimit pid $cl_pid killed)."
     else
-        echo "pid $pid já não tinha throttle ativo."
+        echo "pid $pid no longer had an active throttle."
     fi
 }
 
@@ -199,7 +199,7 @@ unthrottle() {
     require_root
 
     if [ ! -f "$LIMITED_FILE" ]; then
-        echo "Nada registrado em $LIMITED_FILE."
+        echo "No entries in $LIMITED_FILE."
         return 0
     fi
 
@@ -213,47 +213,47 @@ unthrottle() {
         fi
     done <"$LIMITED_FILE"
 
-    [ "$found" -eq 1 ] || echo "Nenhum registro para pid '$target' em $LIMITED_FILE (veja 'status' para os pids ativos)."
-    echo "O registro em $LIMITED_FILE se limpa sozinho na próxima execução (até 1min)."
+    [ "$found" -eq 1 ] || echo "No entry for pid '$target' in $LIMITED_FILE (see 'status' for active PIDs)."
+    echo "The entry in $LIMITED_FILE is cleaned up on the next run (within 1 minute)."
 }
 
-# --- menu interativo (pensado para quem não conhece bash/systemd) ---
+# --- interactive menu for users unfamiliar with bash/systemd ---
 
 menu() {
     local opt n t c r
     while true; do
         echo
         echo "=== cpu-watchdog — menu ==="
-        echo "1) Ver o que está sendo limitado agora"
-        echo "2) Ver histórico (log)"
-        echo "3) Parar um throttle (liberar um processo)"
-        echo "4) Nunca mais limitar um processo por CPU (por nome)"
-        echo "5) Nunca mais matar um processo por memória (por nome)"
-        echo "6) Nunca mais limitar por CPU (por linha de comando/regex — use para python/node/php)"
-        echo "0) Sair"
-        read -rp "Escolha: " opt
+        echo "1) View active throttles"
+        echo "2) View history (log)"
+        echo "3) Stop a throttle (release a process)"
+        echo "4) Exempt a process from CPU throttling (by name)"
+        echo "5) Exempt a process from memory kills (by name)"
+        echo "6) Exempt from CPU throttling (command line/regex — use for python/node/php)"
+        echo "0) Exit"
+        read -rp "Choice: " opt
         case "$opt" in
             1) status ;;
-            2) read -rp "Quantas linhas? [40] " n; show_log "${n:-40}" ;;
+            2) read -rp "How many lines? [40] " n; show_log "${n:-40}" ;;
             3)
                 status
-                read -rp "PID a liberar (ou 'all' para liberar todos): " t
+                read -rp "PID to release (or 'all' to release all): " t
                 [ -n "$t" ] && unthrottle "$t"
                 ;;
             4)
-                read -rp "Nome do processo (comm, ex.: qdrant): " c
+                read -rp "Process name (comm, e.g. qdrant): " c
                 [ -n "$c" ] && whitelist_cpu "$c"
                 ;;
             5)
-                read -rp "Nome do processo (comm): " c
+                read -rp "Process name (comm): " c
                 [ -n "$c" ] && whitelist_mem "$c"
                 ;;
             6)
-                read -rp "Regex ERE contra a linha de comando: " r
+                read -rp "ERE regex against the command line: " r
                 [ -n "$r" ] && whitelist_cmdline "$r"
                 ;;
             0) exit 0 ;;
-            *) echo "Opção inválida." ;;
+            *) echo "Invalid option." ;;
         esac
     done
 }
@@ -266,19 +266,19 @@ case "$cmd" in
     status) status ;;
     log) show_log "${1:-40}" ;;
     unthrottle)
-        [ $# -ge 1 ] || { echo "uso: cpu-watchdog-ctl unthrottle <PID|all>" >&2; exit 2; }
+        [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl unthrottle <PID|all>" >&2; exit 2; }
         unthrottle "$1"
         ;;
     whitelist-cpu)
-        [ $# -ge 1 ] || { echo "uso: cpu-watchdog-ctl whitelist-cpu <comm>" >&2; exit 2; }
+        [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl whitelist-cpu <comm>" >&2; exit 2; }
         whitelist_cpu "$1"
         ;;
     whitelist-mem)
-        [ $# -ge 1 ] || { echo "uso: cpu-watchdog-ctl whitelist-mem <comm>" >&2; exit 2; }
+        [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl whitelist-mem <comm>" >&2; exit 2; }
         whitelist_mem "$1"
         ;;
     whitelist-cmdline)
-        [ $# -ge 1 ] || { echo "uso: cpu-watchdog-ctl whitelist-cmdline <regex>" >&2; exit 2; }
+        [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl whitelist-cmdline <regex>" >&2; exit 2; }
         whitelist_cmdline "$1"
         ;;
     menu) menu ;;

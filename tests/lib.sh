@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Helpers compartilhados pelos testes. Cada teste roda o watchdog de verdade,
-# como subprocesso, contra processos-vítima filhos do próprio teste, com
-# ps/cpulimit/systemd-run/curl/logger/journalctl/systemctl substituídos por
-# stubs e /proc/meminfo simulado.
+# Shared test helpers. Each test runs the real watchdog as a subprocess
+# against harmless child processes, with
+# ps/cpulimit/systemd-run/curl/logger/journalctl/systemctl replaced by
+# stubs and simulated /proc/meminfo.
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WATCHDOG="$REPO_DIR/bin/cpu-watchdog.sh"
@@ -15,28 +15,28 @@ CURRENT_TEST=""
 fail() {
     local msg="$*"
     [ "${#msg}" -le 400 ] || msg="${msg:0:400}…"
-    echo "  FALHOU: $CURRENT_TEST: $msg" >&2
+    echo "  FAILED: $CURRENT_TEST: $msg" >&2
     TESTS_FAILED=$((TESTS_FAILED + 1))
     return 1
 }
 
 assert_contains() {
     local haystack="$1" needle="$2" msg="${3:-}"
-    [[ "$haystack" == *"$needle"* ]] || fail "esperava conter [$needle] ${msg}; obtido: [$haystack]"
+    [[ "$haystack" == *"$needle"* ]] || fail "expected to contain [$needle] ${msg}; got: [$haystack]"
 }
 
 assert_not_contains() {
     local haystack="$1" needle="$2" msg="${3:-}"
-    [[ "$haystack" != *"$needle"* ]] || fail "não devia conter [$needle] ${msg}; obtido: [$haystack]"
+    [[ "$haystack" != *"$needle"* ]] || fail "should not contain [$needle] ${msg}; got: [$haystack]"
 }
 
 assert_eq() {
     local expected="$1" actual="$2" msg="${3:-}"
-    [ "$expected" = "$actual" ] || fail "esperado [$expected], obtido [$actual] ${msg}"
+    [ "$expected" = "$actual" ] || fail "expected [$expected], got [$actual] ${msg}"
 }
 
 assert_alive() {
-    kill -0 "$1" 2>/dev/null || fail "processo $1 devia estar vivo ${2:-}"
+    kill -0 "$1" 2>/dev/null || fail "process $1 should be alive ${2:-}"
 }
 
 assert_dead() {
@@ -45,11 +45,11 @@ assert_dead() {
         kill -0 "$pid" 2>/dev/null || return 0
         sleep 0.05
     done
-    fail "processo $pid devia ter sido encerrado ${2:-}"
+    fail "process $pid should have been terminated ${2:-}"
 }
 
-# Sobe um processo-vítima inofensivo (sleep em loop) cuja cmdline inclui os
-# argumentos extras informados. Imprime o PID.
+# Start a harmless victim process (sleep loop) with the supplied extra
+# arguments in its command line. Print its PID.
 spawn_victim() {
     bash -c 'while :; do sleep 1; done' victim "$@" >/dev/null 2>&1 &
     local pid=$!
@@ -112,12 +112,12 @@ ${EXTRA_CONF:-}
 CONF
 }
 
-# Linha do snapshot de CPU: pid pcpu comm
+# CPU snapshot row: pid pcpu comm
 ps_cpu() { echo "$1 $2 $3" >>"$T/ps_cpu"; }
-# Linha do snapshot de memória: pid rss_kB comm
+# Memory snapshot row: pid rss_kB comm
 ps_mem() { echo "$1 $2 $3" >>"$T/ps_mem"; }
 
-# Expõe o PID real de um processo-vítima dentro do /proc simulado.
+# Expose a real victim PID within simulated /proc.
 link_proc() {
     local pid
     for pid in "$@"; do
@@ -125,16 +125,16 @@ link_proc() {
     done
 }
 
-# Avança os contadores acumulados do /proc/stat simulado (ticks de busy, idle e
-# steal) e regrava a linha agregada "cpu".
+# Advance simulated /proc/stat cumulative counters (busy, idle and steal
+# ticks), then rewrite the aggregate "cpu" line.
 advance_cpu() {
     CPU_USER=$((CPU_USER + $1)); CPU_IDLE=$((CPU_IDLE + $2)); CPU_STEAL=$((CPU_STEAL + ${3:-0}))
     printf 'cpu  %s 0 0 %s 0 0 0 %s 0 0\n' "$CPU_USER" "$CPU_IDLE" "$CPU_STEAL" >"$T/proc/stat"
 }
 
-# Processo simulado no /proc falso, com ticks de CPU acumulados controláveis
-# (diferente do link_proc, que aponta para o /proc real).
-# pid comm ticks [flags] [starttime]; flags com 0x200000 = kernel thread.
+# Simulate a process in fake /proc with controllable cumulative CPU ticks
+# (unlike link_proc, which points to real /proc).
+# pid comm ticks [flags] [starttime]; flags with 0x200000 = kernel thread.
 fake_proc() {
     local pid="$1" comm="$2" ticks="$3" flags="${4:-4194560}" start="${5:-1000}"
     mkdir -p "$T/proc/$pid"
@@ -156,8 +156,8 @@ log_content() { cat "$T/watchdog.log" 2>/dev/null || true; }
 calls() { cat "$T/calls/$1" 2>/dev/null || true; }
 
 teardown_env() {
-    # Arquivo, não array: spawn_victim roda dentro de $(...) e um array
-    # preenchido no subshell se perderia (as vítimas vazariam).
+    # Use a file rather than an array: spawn_victim runs inside $(...), so
+    # an array populated in the subshell would be lost, leaking victims.
     local pid
     while read -r pid; do
         kill -KILL "$pid" 2>/dev/null || true
@@ -179,11 +179,11 @@ run_test() {
 }
 
 finish() {
-    echo "$TESTS_RUN testes, $TESTS_FAILED falha(s)"
+    echo "$TESTS_RUN tests, $TESTS_FAILED failure(s)"
     [ "$TESTS_FAILED" -eq 0 ]
 }
 
-# Vítima que ignora SIGTERM (só morre com SIGKILL).
+# Victim that ignores SIGTERM and only exits on SIGKILL.
 spawn_stubborn_victim() {
     bash -c 'trap "" TERM; while :; do sleep 1; done' victim "$@" >/dev/null 2>&1 &
     local pid=$!

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Camada 3: várias cópias idênticas do mesmo comando -> SIGTERM em todas.
+# Layer 3: identical copies of the same command -> SIGTERM to all.
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-# Isola a Camada 3: Camada 1 nunca atinge o sustain nos testes abaixo.
+# Isolate Layer 3: Layer 1 never reaches its sustain threshold in these tests.
 FB_CONF='SUSTAIN_CHECKS=99
 AGG_SUSTAIN_CHECKS=99'
 
@@ -21,10 +21,10 @@ test_identical_copies_killed_after_sustain() {
     local pids; pids=$(spawn_copies 3 --spin)
     run_watchdog
     local p
-    for p in $pids; do assert_alive "$p" "(1ª medição)"; done
+    for p in $pids; do assert_alive "$p" "(first measurement)"; done
     run_watchdog
     for p in $pids; do assert_dead "$p"; done
-    assert_contains "$(log_content)" "FORKBOMB 3 processos idênticos"
+    assert_contains "$(log_content)" "FORKBOMB 3 identical processes"
 }
 
 test_fewer_than_min_count_not_killed() {

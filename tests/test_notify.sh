@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Notificação via Telegram: o bot token não pode aparecer no argv do curl
-# (visível em `ps`/`/proc/<pid>/cmdline` para qualquer usuário da máquina).
+# Telegram notifications: bot tokens must not appear in curl argv
+# (visible through ps or /proc/<pid>/cmdline to any local user).
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -16,9 +16,9 @@ trigger_throttle() {
 
 test_credentials_not_in_curl_argv() {
     trigger_throttle
-    [ -s "$T/calls/curl.argv" ] || fail "curl não foi chamado"
-    assert_not_contains "$(calls curl.argv)" "FAKEtokenFAKE" "(token no argv do curl)"
-    assert_not_contains "$(calls curl.argv)" "$TEST_CHAT_ID" "(chat_id no argv do curl)"
+    [ -s "$T/calls/curl.argv" ] || fail "curl was not called"
+    assert_not_contains "$(calls curl.argv)" "FAKEtokenFAKE" "(token in curl argv)"
+    assert_not_contains "$(calls curl.argv)" "$TEST_CHAT_ID" "(chat_id in curl argv)"
 }
 
 test_request_still_targets_bot_endpoint_with_chat_and_text() {
@@ -26,7 +26,7 @@ test_request_still_targets_bot_endpoint_with_chat_and_text() {
     local all; all="$(calls curl.argv)$(calls curl.stdin)"
     assert_contains "$all" "https://api.telegram.org/bot${TEST_BOT_TOKEN}/sendMessage"
     assert_contains "$all" "chat_id=${TEST_CHAT_ID}"
-    assert_contains "$all" "limitado a 50%"
+    assert_contains "$all" "limited to 50%"
 }
 
 test_notification_never_includes_cmdline() {

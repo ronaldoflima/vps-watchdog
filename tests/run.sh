@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Roda todos os tests/test_*.sh sem root; veja as dependências no README.
+# Run all tests/test_*.sh as an unprivileged user; see README for dependencies.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1

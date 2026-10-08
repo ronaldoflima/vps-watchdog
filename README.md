@@ -1,288 +1,280 @@
 # vps-watchdog
 
-Watchdog de CPU e memória para VPS Linux com systemd: detecta processos (ou o
-conjunto de processos) consumindo CPU ou memória demais por tempo demais e
-age — throttle (via `cpulimit`) nos casos comuns, `kill` nos casos de fork
-bomb e de falta de memória.
+CPU and memory watchdog for Linux VPS hosts with systemd. It detects processes
+(or groups of processes) consuming too much CPU or memory for too long and
+throttles them with `cpulimit`, or terminates them in fork bomb and low-memory cases.
 
-Nasceu numa VPS de desenvolvimento compartilhada por várias sessões de
-agentes de IA (Claude Code), node e php: primeiro o provedor limitou a máquina
-por uso excessivo e sustentado de CPU; depois um OOM derrubou a máquina — o
-OOM killer do kernel matou `systemd`, `dbus` e o serviço principal enquanto
-as 20 sessões de ~300 MB que inflavam a memória seguiam vivas. As Camadas 1–3
-vieram do primeiro incidente, a Camada 4 do segundo.
+The project started on a development VPS shared by several AI agent sessions
+(Claude Code), node and php. First, the provider throttled the host for sustained
+excessive CPU usage. Later, an OOM event took the host down: the kernel OOM killer
+terminated `systemd`, `dbus` and the main service while the 20 sessions of roughly
+300 MB each that were exhausting memory remained alive. Layers 1–3 came from the
+first incident; Layer 4 came from the second.
 
-Roda como um timer systemd de 1 em 1 minuto.
+It runs once a minute through a systemd timer.
 
-> Antes chamado **cpu-watchdog**. Por compatibilidade com instalações
-> existentes, arquivos, units e caminhos instalados continuam com esse nome
+> Previously named **cpu-watchdog**. For compatibility with existing
+> installations, installed files, units and paths retain that name
 > (`/etc/cpu-watchdog.conf`, `cpu-watchdog.timer`, ...).
 
-## Como funciona
+## How it works
 
-Quatro camadas, todas configuráveis em `/etc/cpu-watchdog.conf`:
+Four layers, all configurable in `/etc/cpu-watchdog.conf`:
 
-- **Camada 1 — processo único**: se um processo sozinho sustenta
-  `CPU_THRESHOLD`% de CPU (base 1 core) por `SUSTAIN_CHECKS` minutos
-  seguidos, ele é limitado a `LIMIT_PERCENT`%.
-- **Camada 2 — uso agregado**: cobre o caso de vários processos moderados
-  que juntos pressionam a máquina sem nenhum sozinho cruzar a Camada 1. Mede o
-  uso real de CPU entre duas execuções (deltas de `/proc/stat`, sem contar
-  idle, iowait nem steal). Se passar de `AGG_CPU_THRESHOLD_PCT`% da capacidade
-  total (nproc × 100) por `AGG_SUSTAIN_CHECKS` minutos seguidos, limita até
-  `AGG_MAX_THROTTLES` processos a `AGG_LIMIT_PERCENT`% cada, na ordem do que
-  mais consumiu no último minuto. Só entra quem usou mais que
-  `AGG_LIMIT_PERCENT`%; kernel threads e processos novos (sem amostra
-  anterior) ficam de fora. Na primeira execução, ou depois de um reboot, só
-  guarda a amostra.
-- **Liberação automática**: throttle não é permanente. O watchdog mede o uso
-  real do processo limitado (`utime+stime` do `/proc`, não o `%CPU` médio do
-  `ps`); se ficar abaixo de `RELEASE_IDLE_PCT`% do limite por
-  `RELEASE_SUSTAIN_CHECKS` minutos, o `cpulimit` é removido e o processo fica
-  isento de novo throttle por `RELEASE_GRACE_MIN` minutos.
-  `RELEASE_SUSTAIN_CHECKS=0` desativa.
-- **Camada 3 — fork bomb**: cobre o caso de N processos com a **mesma linha
-  de comando completa**, cada um sozinho já acima de `CPU_THRESHOLD` (ex.:
-  um `while :; do :; done` disparado várias vezes com `&`). Throttle não
-  escala nesse caso — com processos o bastante, sempre sobra gente rodando a
-  todo vapor. Sustentado por `FORKBOMB_SUSTAIN_CHECKS` execuções com
-  `FORKBOMB_MIN_COUNT` ou mais cópias idênticas, mata todas com `SIGTERM`.
-  Risco conhecido: pools legítimos de workers (php-fpm, gunicorn) sob carga
-  pesada sustentada poderiam, em teoria, casar com esse padrão — se acontecer
-  um falso positivo, adicione o comando à `WHITELIST_COMM`.
-- **Camada 4 — memória**: o kernel só age quando a memória já acabou, e
-  escolhe mal. Duas partes:
-  - **earlyoom** (daemon, reage em ~1s, config em `config/earlyoom.default`):
-    SIGTERM quando RAM disponível <= 6% **e** swap livre <= 10%, SIGKILL em
-    3%/5%. `--prefer` mira node/php/chrome (onde rodam vite, jest, phpunit,
-    browsers headless); `--avoid` protege sshd, systemd, docker, bancos,
-    tailscaled. Sessões `claude` não têm bônus: só morrem depois, pelo
-    tamanho. Rede de segurança contra picos súbitos.
-  - **no watchdog** (a cada minuto), para o que é lento:
-    - 4a: processo com RSS >= `MEM_PROC_KILL_MB` por
-      `MEM_PROC_SUSTAIN_CHECKS` minutos -> SIGTERM; SIGKILL na execução
-      seguinte se ignorar.
-    - 4b: máquina com RAM disponível <= `MEM_AVAIL_KILL_PCT`% e swap livre
-      <= `MEM_SWAP_FREE_KILL_PCT`% por `MEM_SYS_SUSTAIN_CHECKS` minutos ->
-      SIGTERM no maior processo, um por vez, nesta ordem: primeiro quem
-      casa `MEM_PREFER_FIRST_REGEX` (cmdline — ferramentas de teste/build
-      como vite e phpunit), depois `MEM_PREFER_REGEX` (comm — sessões
-      claude, node, php), depois o resto. Antes disso, alerta (com cooldown) ao cruzar
-      `MEM_AVAIL_WARN_PCT` / `MEM_SWAP_USED_WARN_PCT`, listando os maiores
-      grupos por nome (ex.: `20×claude=5361MB`). Em host sem swap, o
-      critério depende só da RAM.
-    - 4c: relata os kills feitos pelo earlyoom.
+- **Layer 1 — single process**: if a process sustains `CPU_THRESHOLD`% CPU
+  (relative to one core) for `SUSTAIN_CHECKS` consecutive minutes, it is limited
+  to `LIMIT_PERCENT`%.
+- **Layer 2 — aggregate usage**: handles multiple moderately busy processes
+  that together overload the host without any one crossing the Layer 1 threshold.
+  It measures actual CPU usage between runs (deltas from `/proc/stat`, excluding
+  idle, iowait and steal). If usage exceeds `AGG_CPU_THRESHOLD_PCT`% of total
+  capacity (nproc × 100) for `AGG_SUSTAIN_CHECKS` consecutive minutes, it limits
+  up to `AGG_MAX_THROTTLES` processes to `AGG_LIMIT_PERCENT`% each, starting with
+  those that consumed the most CPU in the last minute. Only processes that used
+  more than `AGG_LIMIT_PERCENT`% qualify; kernel threads and new processes with
+  no previous sample are excluded. The first run, or a run after reboot, only
+  records a sample.
+- **Automatic release**: throttling is temporary. The watchdog measures the
+  throttled process's actual usage (`utime+stime` from `/proc`, rather than the
+  lifetime `%CPU` average from `ps`). If usage stays below `RELEASE_IDLE_PCT`%
+  of the limit for `RELEASE_SUSTAIN_CHECKS` minutes, `cpulimit` is removed and
+  the process is exempt from further throttling for `RELEASE_GRACE_MIN` minutes.
+  `RELEASE_SUSTAIN_CHECKS=0` disables automatic release.
+- **Layer 3 — fork bomb**: handles N processes with the **same full command
+  line**, each already above `CPU_THRESHOLD` (for example, a
+  `while :; do :; done` loop launched several times with `&`). Throttling does
+  not scale in this case: with enough processes, some always run at full speed.
+  After `FORKBOMB_SUSTAIN_CHECKS` consecutive runs with `FORKBOMB_MIN_COUNT` or
+  more identical copies, all are sent `SIGTERM`. Known risk: legitimate worker
+  pools (php-fpm, gunicorn) under sustained heavy load could match this pattern.
+  If a false positive occurs, add the command name to `WHITELIST_COMM`.
+- **Layer 4 — memory**: the kernel intervenes only when memory is exhausted
+  and may choose the wrong victims. Protection has two parts:
+  - **earlyoom** (daemon, reacts in ~1s, configured in `config/earlyoom.default`):
+    sends SIGTERM when available RAM <= 6% **and** free swap <= 10%, and SIGKILL
+    at 3%/5%. `--prefer` targets node/php/chrome (which run vite, jest, phpunit
+    and headless browsers); `--avoid` protects sshd, systemd, docker, databases
+    and tailscaled. `claude` sessions have no preference bonus: they are selected
+    later based on size. This provides protection against sudden spikes.
+  - **The watchdog** (once a minute) handles slower problems:
+    - 4a: a process with RSS >= `MEM_PROC_KILL_MB` for `MEM_PROC_SUSTAIN_CHECKS`
+      minutes receives SIGTERM, then SIGKILL on the next run if it ignores it.
+    - 4b: if available RAM <= `MEM_AVAIL_KILL_PCT`% and free swap <=
+      `MEM_SWAP_FREE_KILL_PCT`% for `MEM_SYS_SUSTAIN_CHECKS` minutes, the largest
+      process receives SIGTERM, one at a time, in this order: matches for
+      `MEM_PREFER_FIRST_REGEX` (command line — test/build tools such as vite and
+      phpunit), then `MEM_PREFER_REGEX` (comm — claude sessions, node, php), then
+      the rest. Before that, warnings with a cooldown are sent when usage crosses
+      `MEM_AVAIL_WARN_PCT` / `MEM_SWAP_USED_WARN_PCT`, listing the largest groups
+      by name (for example, `20×claude=5361MB`). On hosts without swap, the
+      criterion depends only on RAM.
+    - 4c: reports processes killed by earlyoom.
 
-  A camada de memória usa a própria whitelist, `MEM_WHITELIST_COMM`:
-  `claude` é isento de throttle de CPU mas **pode** ser morto por memória.
+  The memory layer has its own whitelist, `MEM_WHITELIST_COMM`: `claude` is
+  exempt from CPU throttling but **can** be terminated for memory usage.
 
-Processos na `WHITELIST_COMM` (sshd, systemd, cron, etc.) nunca são tocados
-pelas camadas de CPU (1–3). Nomes em ambas as whitelists são o `comm` do
-kernel, truncado em 15 caracteres (`systemd-journald` -> `systemd-journal`).
-`WHITELIST_CMDLINE` (regex ERE contra a linha de comando completa) vale para
-todas as camadas.
+Processes in `WHITELIST_COMM` (sshd, systemd, cron, etc.) are never affected by
+CPU layers (1–3). Names in both whitelists use the kernel's `comm`, truncated to
+15 characters (`systemd-journald` -> `systemd-journal`). `WHITELIST_CMDLINE`
+(an ERE regex against the full command line) applies to all layers.
 
-O `cpulimit` é iniciado com `systemd-run --scope`: o serviço é oneshot com
-`KillMode=control-group`, e um `cpulimit` em background no cgroup do serviço
-era morto pelo systemd assim que o script terminava (o throttle durava
-segundos e era reaplicado a cada execução).
+`cpulimit` is started with `systemd-run --scope`. The watchdog service is oneshot
+with `KillMode=control-group`; a background `cpulimit` in the service's cgroup
+would be killed by systemd as soon as the script exited, making throttling last
+only seconds and requiring it to be reapplied on every run.
 
-Identifica cada processo por `pid:horário-de-início` (lido de
-`/proc/<pid>/stat`) pra não confundir com outro processo que reaproveitou o
-mesmo PID depois.
+Processes are identified by `pid:starttime` (read from `/proc/<pid>/stat`) to
+avoid confusing a process with a later process that reuses the same PID.
 
-## Requisitos e suporte
+## Requirements and support
 
-Alvo: **Linux com systemd**, rodando como root. Testado em Ubuntu 24.04
-(systemd 255, kernel 6.8); o CI roda em Ubuntu 22.04, Ubuntu 24.04 e num
-container `archlinux:latest`. O job Arch valida lint e testes, sem iniciar
-serviços systemd dentro do container.
+Target: **Linux with systemd**, running as root. Tested on Ubuntu 24.04
+(systemd 255, kernel 6.8); CI runs on Ubuntu 22.04, Ubuntu 24.04 and an
+`archlinux:latest` container. The Arch job checks lint and tests, without
+starting systemd services inside the container.
 
-| Dependência | Uso | Obrigatória? |
+| Dependency | Purpose | Required? |
 |---|---|---|
-| bash >= 4.4 | `mapfile -d`, arrays associativos | sim |
-| systemd (`systemctl`, `systemd-run`) | timer, scope próprio do `cpulimit` | sim |
-| procps (`ps`), util-linux (`flock`, `logger`), coreutils, GNU sed, awk | coleta e log | sim |
-| diffutils (`cmp`, `diff`) | instalação idempotente e comparação de config | sim — instalador |
-| `/proc/meminfo`, `/proc/<pid>/{stat,cmdline}` | medição | sim |
-| `cpulimit` | throttle (Camadas 1–2) | não — sem ele o watchdog só alerta |
-| `earlyoom` | picos súbitos de memória | não — recomendado |
-| `curl` | alertas no Telegram | não |
-| `/proc/pressure/memory` (PSI, kernel >= 4.20) | contexto nos alertas | não — mostra `?` |
-| `tailscaled` | drop-in de proteção OOM | não — só aplicado se existir |
+| bash >= 4.4 | `mapfile -d`, associative arrays | yes |
+| systemd (`systemctl`, `systemd-run`) | timer, separate `cpulimit` scope | yes |
+| procps (`ps`), util-linux (`flock`, `logger`), coreutils, GNU sed, awk | collection and logging | yes |
+| diffutils (`cmp`, `diff`) | idempotent installation and configuration comparison | yes — installer |
+| `/proc/meminfo`, `/proc/<pid>/{stat,cmdline}` | measurements | yes |
+| `cpulimit` | throttling (Layers 1–2) | no — without it, the watchdog only alerts |
+| `earlyoom` | sudden memory spikes | no — recommended |
+| `curl` | Telegram alerts | no |
+| `/proc/pressure/memory` (PSI, kernel >= 4.20) | alert context | no — displays `?` |
+| `tailscaled` | OOM protection drop-in | no — applied only if present |
 
-- O `install.sh` suporta Debian/Ubuntu (`apt-get`) e Arch Linux (`pacman`).
-  No Arch, instala `earlyoom` dos repositórios oficiais e continua sem
-  `cpulimit` se ele estiver ausente; veja as instruções do AUR abaixo. Em outras
-  distros, instale ambas as dependências antes de rodar o script
-  (ele pula o que já existe).
-- GNU sed é necessário (`sed -z` e a flag `I` na sanitização). BusyBox/Alpine
-  não é suportado.
-- Containers sem systemd (Docker comum, WSL sem systemd) não são suportados.
+- `install.sh` supports Debian/Ubuntu (`apt-get`) and Arch Linux (`pacman`).
+  On Arch, it installs `earlyoom` from the official repositories and continues
+  without `cpulimit` if missing; see the AUR instructions below. On other
+  distributions, install both dependencies before running the script
+  (it skips existing ones).
+- GNU sed is required (`sed -z` and the `I` flag for sanitization).
+  BusyBox/Alpine is unsupported.
+- Containers without systemd (standard Docker, WSL without systemd) are unsupported.
 
-## Instalação / atualização
+## Installation / updates
 
 ```bash
 sudo ./install.sh
 ```
 
-No **Debian/Ubuntu**, o instalador instala `cpulimit` e `earlyoom` via apt
-quando estiverem ausentes.
+On **Debian/Ubuntu**, the installer installs missing `cpulimit` and `earlyoom`
+packages through apt.
 
-No **Arch Linux**, mantenha o sistema atualizado com `sudo pacman -Syu` antes
-de rodar o instalador. Instale `diffutils` (`sudo pacman -S --needed diffutils`)
-para comparar arquivos e configurações. O instalador instala `earlyoom` com
-`pacman -S --needed --noconfirm earlyoom`, usando a base de pacotes atual.
-O `cpulimit` está no AUR: para usar throttle de CPU, instale-o como usuário comum
-com um helper (por exemplo, `yay -S cpulimit`) e rode `sudo ./install.sh`.
-O instalador nunca compila pacotes do AUR como root. Sem `cpulimit`, as Camadas
-1–2 só registram/alertam e as Camadas 3–4 continuam funcionando.
+On **Arch Linux**, keep the system up to date with `sudo pacman -Syu` before
+running the installer. Ensure `diffutils` is installed
+(`sudo pacman -S --needed diffutils`) for file and configuration comparisons.
+The installer installs missing `earlyoom` with
+`pacman -S --needed --noconfirm earlyoom`, using the current package database.
+`cpulimit` is available from the AUR: install it as your regular user with an
+AUR helper (for example, `yay -S cpulimit`) if you want CPU throttling, then
+run `sudo ./install.sh`. The installer never builds AUR packages as root;
+without `cpulimit`, Layers 1–2 only log and alert and Layers 3–4 remain active.
 
-As whitelists padrão incluem `cron`/`crond` e protegem tanto `php-fpm8.3`
-quanto `php-fpm` dos kills do watchdog por memória. Numa config existente,
-adicione `crond` a `WHITELIST_COMM` e `MEM_WHITELIST_COMM`, e `php-fpm` a
-`MEM_WHITELIST_COMM` manualmente: o instalador preserva o arquivo customizado.
+The default whitelists include `cron`/`crond` and protect both `php-fpm8.3`
+and `php-fpm` from watchdog memory kills. For an existing custom configuration,
+add `crond` to `WHITELIST_COMM` and `MEM_WHITELIST_COMM`, and `php-fpm` to
+`MEM_WHITELIST_COMM` yourself; rerunning the installer preserves that file.
 
-Idempotente — rode de novo sempre que mudar algo neste repo:
+The installer is idempotent. Run it again whenever this repository changes:
 
-- Copia `bin/cpu-watchdog.sh` e as units em `systemd/` só se o conteúdo mudou.
-- Dá `systemctl daemon-reload` + `restart` no timer automaticamente quando
-  algo muda.
-- Instala `/etc/cpu-watchdog.conf` a partir de `config/cpu-watchdog.conf.example`
-  **só na primeira vez**. Se já existe e foi customizado (ex.: tokens de
-  Telegram preenchidos, thresholds ajustados), o install nunca sobrescreve —
-  só mostra o diff em relação ao template do repo, com valores sensíveis
-  mascarados.
-- Instala dependências ausentes via apt no Debian/Ubuntu; no Arch, instala
-  `earlyoom` via pacman e mostra instruções do AUR para `cpulimit`.
-- **Sobrescreve** `/etc/default/earlyoom` com `config/earlyoom.default` (e
-  reinicia o earlyoom) sempre que o conteúdo difere — faça backup antes da
-  primeira instalação se você já tinha um earlyoom customizado.
+- Copies `bin/cpu-watchdog.sh` and the units in `systemd/` only if content changed.
+- Automatically runs `systemctl daemon-reload` and restarts the timer when needed.
+- Installs `/etc/cpu-watchdog.conf` from `config/cpu-watchdog.conf.example`
+  **only on the first installation**. If the file already exists and is customized
+  (for example, Telegram credentials or adjusted thresholds), it is never
+  overwritten. The installer only displays a diff against the repository template,
+  with sensitive values redacted.
+- Installs missing dependencies through apt on Debian/Ubuntu; on Arch,
+  installs `earlyoom` through pacman and prints AUR instructions for `cpulimit`.
+- **Overwrites** `/etc/default/earlyoom` with `config/earlyoom.default` and
+  restarts earlyoom whenever content differs. Back up any customized earlyoom
+  configuration before the first installation.
 
-Configs antigas continuam válidas: nenhuma variável nova é obrigatória.
+Older configurations remain valid: no new variable is required.
 
-## Recursos opcionais
+## Optional features
 
-- **Alertas via Telegram**: preencha `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`
-  em `/etc/cpu-watchdog.conf`. Em branco = só loga localmente. Token e chat_id
-  são passados ao `curl` pelo stdin, nunca no argv. As mensagens trazem nome do
-  processo, PID e ação — nunca a linha de comando.
-- **earlyoom**: instalado e configurado pelo `install.sh`. Para não usar,
-  `sudo systemctl disable --now earlyoom` depois da instalação (as Camadas
-  4a/4b do watchdog continuam valendo; a 4c fica inativa).
-- **Proteção OOM do tailscaled**: se `tailscaled.service` existir, o install
-  aplica `OOMScoreAdjust=-900` via drop-in (e ao vivo com `choom`, sem
-  reiniciar o tailscaled). Nada é feito se não houver tailscale.
-- **Sem `cpulimit`**: as Camadas 1–2 só registram/alertam
-  (`ALERTA (cpulimit ausente)`); Camadas 3–4 funcionam normalmente.
+- **Telegram alerts**: set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in
+  `/etc/cpu-watchdog.conf`. Empty values mean local logging only. Token and
+  chat_id are passed to `curl` through stdin, never argv. Messages include the
+  process name, PID and action, never the command line.
+- **earlyoom**: installed and configured by `install.sh`. To disable it, run
+  `sudo systemctl disable --now earlyoom` after installation. Watchdog Layers
+  4a/4b remain active; Layer 4c becomes inactive.
+- **tailscaled OOM protection**: if `tailscaled.service` exists, the installer
+  applies `OOMScoreAdjust=-900` through a drop-in and updates the running process
+  with `choom`, without restarting tailscaled. It does nothing if Tailscale is absent.
+- **Without `cpulimit`**: Layers 1–2 only log and alert
+  (`ALERT (cpulimit missing)`); Layers 3–4 work normally.
 
-## Logs e segredos
+## Logs and secrets
 
-A linha de comando dos processos afetados vai para o log local e para o
-journal, **sanitizada** — nunca para o Telegram. Viram `<redacted>`:
+Affected processes' command lines are **sanitized** before being written to the
+local log and journal, and are never sent to Telegram. The following become
+`<redacted>`:
 
-- valores de flags e variáveis com nomes sensíveis (`--password x`,
-  `--token=x`, `DB_PASSWORD=x`, `"password":"x"` em JSON), inclusive valores
-  com espaços;
-- senha ou token em URL (`postgres://u:x@host`, `https://TOKEN@github.com`),
-  query params e fragmentos (`?access_token=x`, `#access_token=x`), DSN Go
-  (`u:x@tcp(host)`);
-- headers de autenticação (`Authorization: Bearer x`, `X-Api-Key: x`,
-  `Cookie: x`), inclusive embutidos (`--header=X-Api-Key: x`);
-- `user:senha` do curl (`--user`, `-u`, `--proxy-user`, `-U`, com ou sem `=`);
-- flags curtas de senha de programas conhecidos: `mysql`/`mariadb -pSENHA`,
-  `sshpass -p`, `redis-cli -a`, `docker`/`podman`/`helm ... login -p`;
-- formatos conhecidos de token (GitHub, GitLab, Slack, AWS, OpenAI/Anthropic,
-  Google, JWT, bot do Telegram).
+- Values of flags and variables with sensitive names (`--password x`, `--token=x`,
+  `DB_PASSWORD=x`, `"password":"x"` in JSON), including values containing spaces.
+- Passwords or tokens in URLs (`postgres://u:x@host`, `https://TOKEN@github.com`),
+  query parameters and fragments (`?access_token=x`, `#access_token=x`), and Go
+  DSNs (`u:x@tcp(host)`).
+- Authentication headers (`Authorization: Bearer x`, `X-Api-Key: x`, `Cookie: x`),
+  including embedded headers (`--header=X-Api-Key: x`).
+- curl's `user:password` (`--user`, `-u`, `--proxy-user`, `-U`, with or without `=`).
+- Short password flags for known programs: `mysql`/`mariadb -pPASSWORD`,
+  `sshpass -p`, `redis-cli -a`, `docker`/`podman`/`helm ... login -p`.
+- Known token formats (GitHub, GitLab, Slack, AWS, OpenAI/Anthropic, Google,
+  JWT, Telegram bot).
 
-Argumentos com espaços (`sh -c '...'`, processos que reescrevem o próprio
-argv) são quebrados em palavras e passam pelas mesmas regras. A comparação é
-feita byte a byte (`LC_ALL=C`), então UTF-8 inválido não escapa das regras.
-Caracteres de controle viram `?` (sem forjar linhas no log), a linha é
-truncada em 1024 bytes e argv gigantes param de ser processados logo após o
-limite.
+Arguments containing spaces (`sh -c '...'`, processes rewriting their argv) are
+split into words and processed with the same rules. Matching is byte-oriented
+(`LC_ALL=C`), so invalid UTF-8 cannot bypass the rules. Control characters become
+`?` to prevent forged log lines. Lines are truncated to 1024 bytes, and huge argv
+lists stop being processed soon after the limit.
 
-É uma heurística que prefere redigir demais (`--author x` também some). Ainda
-escapam: segredo posicional ou em formato desconhecido sem nome sugestivo,
-flag curta de programa fora da lista acima, valor que começa com `-` depois
-de flag sensível (`--password -x`) e cookies com vários pares (só o primeiro é
-redigido). Arquivos novos são criados com `umask 077` (log `600`, estado
-`700`); um log que já existia mantém o modo antigo. Veja
-[SECURITY.md](SECURITY.md).
+This is a heuristic that favors over-redaction (`--author x` is also removed).
+It can still miss positional secrets or unknown formats without a suggestive
+name, short flags for programs outside the list above, values starting with `-`
+after sensitive flags (`--password -x`), and cookies with multiple pairs (only
+the first is redacted). New files use `umask 077` (log `600`, state `700`);
+existing logs retain their previous permissions. See [SECURITY.md](SECURITY.md).
 
-## Arquivos em produção
+## Installed files
 
-| O quê | Onde |
+| Item | Location |
 |---|---|
 | Script | `/usr/local/bin/cpu-watchdog.sh` |
-| Ferramenta de gerenciamento | `/usr/local/bin/cpu-watchdog-ctl` |
-| Config | `/etc/cpu-watchdog.conf` |
-| Estado (não editar) | `/var/lib/cpu-watchdog/*.tsv` |
-| Log de ações | `/var/log/cpu-watchdog.log` (e `journalctl -u cpu-watchdog`) |
+| Management tool | `/usr/local/bin/cpu-watchdog-ctl` |
+| Configuration | `/etc/cpu-watchdog.conf` |
+| State (do not edit) | `/var/lib/cpu-watchdog/*.tsv` |
+| Action log | `/var/log/cpu-watchdog.log` (and `journalctl -u cpu-watchdog`) |
 | Units | `/etc/systemd/system/cpu-watchdog.{service,timer}` |
-| Throttles ativos | `systemctl list-units 'cpu-watchdog-limit-*'` |
-| earlyoom | `/etc/default/earlyoom` (e `journalctl -u earlyoom`) |
-| Proteção OOM do tailscaled | `/etc/systemd/system/tailscaled.service.d/oom.conf` |
+| Active throttles | `systemctl list-units 'cpu-watchdog-limit-*'` |
+| earlyoom | `/etc/default/earlyoom` (and `journalctl -u earlyoom`) |
+| tailscaled OOM protection | `/etc/systemd/system/tailscaled.service.d/oom.conf` |
 
-## Operação
+## Operations
 
-O jeito mais simples de ver o que está sendo limitado e agir, sem precisar
-saber os caminhos de arquivo nem comandos de systemd de cor:
+Use the management tool to inspect active throttles and take action without
+memorizing file paths or systemd commands:
 
 ```bash
-sudo cpu-watchdog-ctl            # menu interativo
-sudo cpu-watchdog-ctl status     # o que está limitado agora + snapshot da máquina
-sudo cpu-watchdog-ctl log 100    # últimas 100 linhas do log
+sudo cpu-watchdog-ctl            # interactive menu
+sudo cpu-watchdog-ctl status     # active throttles + host snapshot
+sudo cpu-watchdog-ctl log 100    # last 100 log lines
 ```
 
-Parar um throttle ativo (libera o processo, mata só o `cpulimit` associado):
+Stop an active throttle (releases the process and kills only its `cpulimit`):
 
 ```bash
-sudo cpu-watchdog-ctl unthrottle <PID>   # PID do processo alvo, não o do cpulimit
-sudo cpu-watchdog-ctl unthrottle all     # libera todos de uma vez
+sudo cpu-watchdog-ctl unthrottle <PID>   # target process PID, not the cpulimit PID
+sudo cpu-watchdog-ctl unthrottle all     # release all throttles
 ```
 
-Isso resolve só o throttle atual — se o processo continuar consumindo
-demais, ele volta a ser limitado no próximo ciclo. Para isentar de vez, use
-a whitelist:
+This only removes the current throttle. If the process keeps consuming too much
+CPU, it will be throttled again on a later run. For a permanent exemption, use
+the whitelist:
 
 ```bash
-sudo cpu-watchdog-ctl whitelist-cpu qdrant           # nunca mais throttle de CPU (Camadas 1-3)
-sudo cpu-watchdog-ctl whitelist-mem qdrant           # nunca mais kill por memória (Camada 4)
-sudo cpu-watchdog-ctl whitelist-cmdline 'meu-job\.py' # quando o nome do processo é genérico (python, node, php)
+sudo cpu-watchdog-ctl whitelist-cpu qdrant          # exempt from CPU layers (1–3)
+sudo cpu-watchdog-ctl whitelist-mem qdrant          # exempt from memory layer (4)
+sudo cpu-watchdog-ctl whitelist-cmdline 'my-job\.py' # for generic names such as python/node/php
 ```
 
-Não precisa reiniciar nada depois de mexer na whitelist — o watchdog lê
-`/etc/cpu-watchdog.conf` a cada execução (1x/min).
+No restart is needed after whitelist changes: the watchdog reads
+`/etc/cpu-watchdog.conf` on every run (once a minute).
 
-Comandos equivalentes "na mão", sem o `cpu-watchdog-ctl` (o que o script
-acima faz por baixo dos panos):
+Equivalent manual commands (used by the management tool):
 
 ```bash
-systemctl status cpu-watchdog.timer      # está rodando?
-tail -f /var/log/cpu-watchdog.log        # ações em tempo real
-systemctl stop cpu-watchdog.timer        # pausar
-systemctl stop cpu-watchdog-limit-<PID>-<starttime>.scope   # liberar 1 throttle
-# ou: pkill -f "cpulimit -p <PID>"
+systemctl status cpu-watchdog.timer      # is it running?
+tail -f /var/log/cpu-watchdog.log        # actions in real time
+systemctl stop cpu-watchdog.timer        # pause
+systemctl stop cpu-watchdog-limit-<PID>-<starttime>.scope   # release one throttle
+# or: pkill -f "cpulimit -p <PID>"
 ```
 
 ## Rollback
 
-**Voltar para uma versão anterior** (o config instalado não é tocado):
+**Restore an earlier version** (preserves the installed watchdog configuration):
 
 ```bash
-git checkout <commit-ou-tag-anterior>
+git checkout <previous-commit-or-tag>
 sudo ./install.sh
 ```
 
-**Desligar sem desinstalar** (reversível com `enable --now`):
+**Disable without uninstalling** (reversible with `enable --now`):
 
 ```bash
 sudo systemctl disable --now cpu-watchdog.timer
-sudo systemctl stop 'cpu-watchdog-limit-*.scope'   # solta throttles ativos
+sudo systemctl stop 'cpu-watchdog-limit-*.scope'   # release active throttles
 ```
 
-**Desinstalar**:
+**Uninstall**:
 
 ```bash
 sudo systemctl disable --now cpu-watchdog.timer
@@ -290,42 +282,41 @@ sudo systemctl stop 'cpu-watchdog-limit-*.scope'
 sudo rm /etc/systemd/system/cpu-watchdog.service /etc/systemd/system/cpu-watchdog.timer
 sudo rm /usr/local/bin/cpu-watchdog.sh /usr/local/bin/cpu-watchdog-ctl
 sudo rm -r /var/lib/cpu-watchdog /run/cpu-watchdog.lock
-sudo cp /etc/cpu-watchdog.conf ~/cpu-watchdog.conf.bak && sudo rm /etc/cpu-watchdog.conf  # contém o token
-sudo rm /etc/systemd/system/tailscaled.service.d/oom.conf   # se existir
+sudo cp /etc/cpu-watchdog.conf ~/cpu-watchdog.conf.bak && sudo rm /etc/cpu-watchdog.conf  # contains the token
+sudo rm /etc/systemd/system/tailscaled.service.d/oom.conf   # if present
 sudo systemctl daemon-reload
-# earlyoom: desligar, ou remover o pacote, ou restaurar seu /etc/default/earlyoom
+# earlyoom: disable it, remove the package, or restore your /etc/default/earlyoom
 sudo systemctl disable --now earlyoom
 ```
 
-O log `/var/log/cpu-watchdog.log` fica para auditoria; apague quando não
-precisar mais. O ajuste ao vivo de OOM do tailscaled some no próximo restart
-dele.
+The log `/var/log/cpu-watchdog.log` remains for auditing; delete it when no longer
+needed. The live tailscaled OOM adjustment resets on its next restart.
 
-## Desenvolvimento
+## Development
+
+English is the default language for documentation, code comments, user-facing
+messages, commit messages, issues and pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
 tests/lint.sh   # bash -n, shellcheck, systemd-analyze verify
-tests/run.sh    # testes das camadas, sanitização, notificação, config e instalador
+tests/run.sh    # layer, sanitization, notification, configuration and installer tests
 ```
 
-Os testes exigem as ferramentas listadas acima, incluindo `diffutils` para
-os testes do instalador. Rodam sem root e sem tocar o sistema. Os testes do
-instalador usam destinos temporários e simulam os gerenciadores de pacotes e
-serviços. Os demais executam o script de verdade
-contra processos-vítima filhos do próprio teste, com `ps`, `cpulimit`,
-`systemd-run`, `curl`, `logger`, `journalctl` e `systemctl` substituídos por
-stubs (`tests/stubs/`). Para isso o script aceita três overrides de ambiente,
-que o systemd nunca define e que são **ignorados quando o script roda como
-root**:
+Tests require the runtime tools listed above, including `diffutils` for installer
+tests. They run without root and without modifying the system. Installer tests
+redirect file destinations to a temporary directory and simulate package and
+service managers. Other tests execute the actual
+script against harmless child processes, replacing `ps`, `cpulimit`,
+`systemd-run`, `curl`, `logger`, `journalctl` and `systemctl` with stubs
+(`tests/stubs/`). For this purpose, the script accepts three environment
+overrides that systemd never sets and that are **ignored when running as root**:
 
-| Variável | Default |
+| Variable | Default |
 |---|---|
 | `CPU_WATCHDOG_CONF` | `/etc/cpu-watchdog.conf` |
 | `CPU_WATCHDOG_LOCK` | `/run/cpu-watchdog.lock` |
 | `CPU_WATCHDOG_PROC_DIR` | `/proc` |
 
-Veja [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Licença
+## License
 
 [MIT](LICENSE).
