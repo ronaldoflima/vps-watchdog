@@ -1,4 +1,6 @@
-# Managed alongside cpu-watchdog (see /etc/cpu-watchdog.conf, Layer 4).
+# Example earlyoom policy, independent of cpu-watchdog MODE.
+# Installer preserves existing configuration unless --replace-earlyoom is explicit.
+# MODE=observe does not prevent an already-running earlyoom from killing processes.
 #
 # SIGTERM when available RAM <= 6% AND free swap <= 10% of totals;
 # SIGKILL at 3% / 5%. Reacts in ~1s, protecting against the kernel OOM killer,

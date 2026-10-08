@@ -1,4 +1,9 @@
 # cpu-watchdog configuration
+# active applies throttles/signals. observe logs proposals and optional alerts only.
+# Older configurations without MODE retain active behavior.
+# Observe does not stop existing throttles or the independent earlyoom daemon.
+MODE=active
+
 # CPU_THRESHOLD: %CPU relative to one core (ps -o %cpu), above which a
 #                process is counted as consuming too much CPU.
 CPU_THRESHOLD=80

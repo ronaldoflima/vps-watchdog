@@ -22,13 +22,42 @@ fi
 
 CONF="${CPU_WATCHDOG_CONF:-/etc/cpu-watchdog.conf}"
 
+MODE=active
 # shellcheck source=config/cpu-watchdog.conf.example
 source "$CONF"
+case "$MODE" in
+    active|observe) ;;
+    *) echo "Invalid MODE: $MODE (expected active or observe)" >&2; exit 2 ;;
+esac
 
 # After source: configuration cannot control the lock or /proc.
 LOCK_FILE="${CPU_WATCHDOG_LOCK:-/run/cpu-watchdog.lock}"
 PROC_DIR="${CPU_WATCHDOG_PROC_DIR:-/proc}"
 
+# Both modes share a lock, but observation must never mutate active policy state.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    exit 0
+fi
+if [ "$MODE" = observe ]; then
+    ACTIVE_STATE_DIR="$STATE_DIR"
+    STATE_DIR="$STATE_DIR/observe"
+    mkdir -p "$STATE_DIR"
+    # Snapshot existing throttles for release evaluation, without controlling them.
+    if [ -f "$ACTIVE_STATE_DIR/limited.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/limited.tsv" "$STATE_DIR/limited.tsv"
+    else
+        : >"$STATE_DIR/limited.tsv"
+    fi
+    if [ -f "$ACTIVE_STATE_DIR/released.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/released.tsv" "$STATE_DIR/released.tsv"
+    else
+        : >"$STATE_DIR/released.tsv"
+    fi
+    if [ ! -f "$STATE_DIR/release.tsv" ] && [ -f "$ACTIVE_STATE_DIR/release.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/release.tsv" "$STATE_DIR/release.tsv"
+    fi
+fi
 mkdir -p "$STATE_DIR"
 
 COUNTS_FILE="$STATE_DIR/counts.tsv"
@@ -40,19 +69,15 @@ GRACE_FILE="$STATE_DIR/released.tsv"
 
 touch "$COUNTS_FILE" "$LIMITED_FILE" "$RELEASE_FILE" "$GRACE_FILE"
 
-# Prevent concurrent watchdog runs.
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    exit 0
-fi
-
 log() {
+    if [ "$MODE" = observe ]; then set -- "OBSERVE $*"; fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG_FILE"
     logger -t cpu-watchdog "$*"
 }
 
 notify() {
     local msg="$1"
+    if [ "$MODE" = observe ]; then msg="OBSERVE: $msg"; fi
 
     [ -n "${TELEGRAM_BOT_TOKEN:-}" ] &&
     [ -n "${TELEGRAM_CHAT_ID:-}" ] || return 0
@@ -72,6 +97,10 @@ url = "$(curl_config_escape "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/s
 data = "$(curl_config_escape "chat_id=${TELEGRAM_CHAT_ID}")"
 CURLCFG
 }
+
+if [ "$MODE" = observe ]; then
+    log "MODE observe: proposed actions only; existing throttles are not released. Independent earlyoom may still terminate processes."
+fi
 
 curl_config_escape() {
     local v="$1"
@@ -348,6 +377,17 @@ apply_throttle() {
 
     local cmdline
     cmdline=$(get_safe_cmdline "$pid" "$comm")
+
+    if [ "$MODE" = observe ]; then
+        if ! command -v cpulimit >/dev/null 2>&1; then
+            log "$reason pid=$pid comm=$comm -> would alert (cpulimit missing) cmd=[$cmdline]"
+            notify "cpu-watchdog: $reason — would alert for '$comm' (pid $pid); cpulimit missing."
+            return 0
+        fi
+        log "$reason pid=$pid comm=$comm -> would limit to ${limit}% cmd=[$cmdline]"
+        notify "cpu-watchdog: $reason — would limit '$comm' (pid $pid) to ${limit}%."
+        return 0
+    fi
 
     if command -v cpulimit >/dev/null 2>&1; then
         # cpulimit must leave the cpu-watchdog.service cgroup. The service is
@@ -715,14 +755,19 @@ for cmdline in "${!FB_GROUP_PIDS[@]}"; do
         comm="${FB_GROUP_COMM[$cmdline]}"
         safe_cmdline=$(get_safe_cmdline "${pids%% *}" "$comm")
 
-        log "FORKBOMB $count identical processes ('$comm') sustained >=${FORKBOMB_SUSTAIN_CHECKS}min -> terminating pids=[$pids] cmd=[$safe_cmdline]"
+        if [ "$MODE" = observe ]; then
+            log "FORKBOMB $count identical processes ('$comm') -> would send SIGTERM to pids=[$pids] cmd=[$safe_cmdline]"
+            notify "cpu-watchdog: FORKBOMB — would send SIGTERM to $count identical processes ('$comm')."
+        else
+            log "FORKBOMB $count identical processes ('$comm') sustained >=${FORKBOMB_SUSTAIN_CHECKS}min -> terminating pids=[$pids] cmd=[$safe_cmdline]"
 
-        for kpid in $pids; do
-            kill -TERM "$kpid" 2>/dev/null || true
-        done
+            for kpid in $pids; do
+                kill -TERM "$kpid" 2>/dev/null || true
+            done
 
-        notify "🚨 cpu-watchdog: FORKBOMB detected — $count identical processes ('$comm') terminated (SIGTERM).
+            notify "🚨 cpu-watchdog: FORKBOMB detected — $count identical processes ('$comm') terminated (SIGTERM).
 full details: ${LOG_FILE}"
+        fi
     fi
 done
 
@@ -813,6 +858,12 @@ mem_kill() {
 
     cmdline=$(get_safe_cmdline "$pid" "$comm")
 
+    if [ "$MODE" = observe ]; then
+        log "$reason pid=$pid comm=$comm rss=${rss}MB -> would send SIG$sig cmd=[$cmdline]"
+        notify "cpu-watchdog: $reason — would send SIG$sig to '$comm' (pid $pid, ${rss} MB)."
+        return 0
+    fi
+
     kill "-$sig" "$pid" 2>/dev/null || return 1
 
     log "$reason pid=$pid comm=$comm rss=${rss}MB -> SIG$sig cmd=[$cmdline]"
@@ -897,7 +948,8 @@ while read -r pid rss comm; do
                 "MEM_PROC ignored SIGTERM, still using ${rss}MB" || true
         elif mem_kill "$pid" "$comm" "$rss" TERM \
             "MEM_PROC ${rss}MB >= ${MEM_PROC_KILL_MB}MB for >=${MEM_PROC_SUSTAIN_CHECKS}min"; then
-            termed=1
+            # A proposed SIGTERM is not evidence that a process ignored SIGTERM.
+            if [ "$MODE" = active ]; then termed=1; fi
         fi
     fi
 
@@ -1065,6 +1117,12 @@ release_idle_throttles() {
         fi
 
         if [ "$idle" -ge "$sustain" ]; then
+            if [ "$MODE" = observe ]; then
+                log "RELEASE pid=$pid -> would remove throttle: actual usage below ${threshold}% for ${sustain} runs"
+                notify "cpu-watchdog: would remove throttle from pid $pid (low actual usage)."
+                printf '%s\t%s\t%s\t%s\n' "$key" "$ticks" "$NOW" "$idle" >>"${RELEASE_FILE}.new"
+                continue
+            fi
             scope="cpu-watchdog-limit-${key/:/-}.scope"
             if ! systemctl stop "$scope" >/dev/null 2>&1; then
                 kill "$cl_pid" 2>/dev/null || true
