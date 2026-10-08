@@ -1,17 +1,20 @@
 # vps-watchdog
 
-CPU and memory watchdog for Linux VPS hosts with systemd. It detects processes
-(or groups of processes) consuming too much CPU or memory for too long and
-throttles them with `cpulimit`, or terminates them in fork bomb and low-memory cases.
+A configurable CPU and memory watchdog for Linux VPS hosts with systemd.
+It detects sustained resource pressure from individual processes or groups of
+processes, applies CPU throttling, and terminates eligible processes under
+configured fork bomb or memory conditions.
 
-The project started on a development VPS shared by several AI agent sessions
-(Claude Code), node and php. First, the provider throttled the host for sustained
-excessive CPU usage. Later, an OOM event took the host down: the kernel OOM killer
-terminated `systemd`, `dbus` and the main service while the 20 sessions of roughly
-300 MB each that were exhausting memory remained alive. Layers 1–3 came from the
-first incident; Layer 4 came from the second.
+Use it to manage resource contention on hosts running background jobs, worker
+processes, build and test workloads, or interactive tools. CPU limits are applied
+with `cpulimit` and released automatically when usage drops. Memory protection
+combines periodic checks with `earlyoom` for sudden pressure, with configurable
+exemptions and process selection priorities.
 
-It runs once a minute through a systemd timer.
+The watchdog runs once a minute through a systemd timer. Its policy applies across
+the host: review thresholds, whitelists and memory priorities for your workload
+before enabling it. The supplied configuration is a starting point oriented
+toward development workloads; see [Configuring for your workload](#configuring-for-your-workload).
 
 > Previously named **cpu-watchdog**. For compatibility with existing
 > installations, installed files, units and paths retain that name
@@ -52,26 +55,29 @@ Four layers, all configurable in `/etc/cpu-watchdog.conf`:
   and may choose the wrong victims. Protection has two parts:
   - **earlyoom** (daemon, reacts in ~1s, configured in `config/earlyoom.default`):
     sends SIGTERM when available RAM <= 6% **and** free swap <= 10%, and SIGKILL
-    at 3%/5%. `--prefer` targets node/php/chrome (which run vite, jest, phpunit
-    and headless browsers); `--avoid` protects sshd, systemd, docker, databases
-    and tailscaled. `claude` sessions have no preference bonus: they are selected
-    later based on size. This provides protection against sudden spikes.
+    at 3%/5%. Its `--prefer` and `--avoid` patterns define which process names
+    to favor or protect when selecting a victim. The supplied policy favors
+    selected application runtimes and browser processes, while protecting
+    essential services. Configure these patterns for your host. This provides
+    protection against sudden spikes.
   - **The watchdog** (once a minute) handles slower problems:
     - 4a: a process with RSS >= `MEM_PROC_KILL_MB` for `MEM_PROC_SUSTAIN_CHECKS`
       minutes receives SIGTERM, then SIGKILL on the next run if it ignores it.
     - 4b: if available RAM <= `MEM_AVAIL_KILL_PCT`% and free swap <=
       `MEM_SWAP_FREE_KILL_PCT`% for `MEM_SYS_SUSTAIN_CHECKS` minutes, the largest
-      process receives SIGTERM, one at a time, in this order: matches for
-      `MEM_PREFER_FIRST_REGEX` (command line — test/build tools such as vite and
-      phpunit), then `MEM_PREFER_REGEX` (comm — claude sessions, node, php), then
-      the rest. Before that, warnings with a cooldown are sent when usage crosses
+      eligible process receives SIGTERM, one at a time. Selection prioritizes
+      full command lines matching `MEM_PREFER_FIRST_REGEX`, then process names
+      matching `MEM_PREFER_REGEX`, then other eligible processes. Within each
+      priority group, the largest RSS is selected first. Before that, warnings
+      with a cooldown are sent when usage crosses
       `MEM_AVAIL_WARN_PCT` / `MEM_SWAP_USED_WARN_PCT`, listing the largest groups
-      by name (for example, `20×claude=5361MB`). On hosts without swap, the
+      by name (for example, `12×worker=3600MB`). On hosts without swap, the
       criterion depends only on RAM.
     - 4c: reports processes killed by earlyoom.
 
-  The memory layer has its own whitelist, `MEM_WHITELIST_COMM`: `claude` is
-  exempt from CPU throttling but **can** be terminated for memory usage.
+  The memory layer has its own whitelist, `MEM_WHITELIST_COMM`. A process
+  exempt from CPU throttling **can still** be terminated for memory usage
+  unless it is also exempt from the memory layer.
 
 Processes in `WHITELIST_COMM` (sshd, systemd, cron, etc.) are never affected by
 CPU layers (1–3). Names in both whitelists use the kernel's `comm`, truncated to
@@ -155,6 +161,36 @@ The installer is idempotent. Run it again whenever this repository changes:
   configuration before the first installation.
 
 Older configurations remain valid: no new variable is required.
+
+## Configuring for your workload
+
+The detection logic uses resource measurements and configurable process matches;
+it does not require a particular application or programming language. The
+supplied policies include choices for development workloads, such as CPU
+exemptions for interactive tools and memory priorities for test/build processes.
+Review them rather than assuming they match your services.
+
+| Setting | What to choose for your host |
+|---|---|
+| `CPU_THRESHOLD`, `AGG_CPU_THRESHOLD_PCT` and sustain checks | How much sustained CPU usage should trigger throttling |
+| `WHITELIST_COMM` | Process names exempt from CPU layers (1–3) |
+| `WHITELIST_CMDLINE` | Full command-line patterns exempt from all watchdog layers |
+| `MEM_PROC_KILL_MB` and memory pressure thresholds | Acceptable process size and remaining host memory |
+| `MEM_WHITELIST_COMM` | Process names the watchdog must never terminate for memory usage |
+| `MEM_PREFER_FIRST_REGEX` | Command-line patterns for workloads to terminate first under host memory pressure |
+| `MEM_PREFER_REGEX` | Process names to prioritize next under host memory pressure |
+| earlyoom `--prefer` / `--avoid` | A separate victim selection policy for sudden memory pressure |
+
+For example, a host running disposable batch jobs may prioritize those jobs for
+termination while protecting its database and remote access. Another host may
+need to protect long-running workers and allow them sustained CPU usage. Use
+command-line patterns when a process name is shared by several applications.
+
+The watchdog and earlyoom have separate policies: watchdog whitelists do not
+configure earlyoom. Review both
+[`config/cpu-watchdog.conf.example`](config/cpu-watchdog.conf.example) and
+[`config/earlyoom.default`](config/earlyoom.default). See
+[SECURITY.md](SECURITY.md) for configuration permissions and process selection risks.
 
 ## Optional features
 
@@ -240,8 +276,8 @@ CPU, it will be throttled again on a later run. For a permanent exemption, use
 the whitelist:
 
 ```bash
-sudo cpu-watchdog-ctl whitelist-cpu qdrant          # exempt from CPU layers (1–3)
-sudo cpu-watchdog-ctl whitelist-mem qdrant          # exempt from memory layer (4)
+sudo cpu-watchdog-ctl whitelist-cpu batch-worker    # exempt from CPU layers (1–3)
+sudo cpu-watchdog-ctl whitelist-mem batch-worker    # exempt from memory layer (4)
 sudo cpu-watchdog-ctl whitelist-cmdline 'my-job\.py' # for generic names such as python/node/php
 ```
 
@@ -316,6 +352,14 @@ overrides that systemd never sets and that are **ignored when running as root**:
 | `CPU_WATCHDOG_CONF` | `/etc/cpu-watchdog.conf` |
 | `CPU_WATCHDOG_LOCK` | `/run/cpu-watchdog.lock` |
 | `CPU_WATCHDOG_PROC_DIR` | `/proc` |
+
+## Background
+
+The project grew out of two incidents on a shared VPS: provider throttling after
+sustained CPU usage, followed by an OOM event that stopped essential services
+while memory-heavy workloads remained alive. CPU throttling and memory protection
+were added to address those failures. Their thresholds and process selection
+policies are configurable so they can be adapted to other hosts.
 
 ## License
 
