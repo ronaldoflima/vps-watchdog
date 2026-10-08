@@ -149,7 +149,7 @@ test_observe_missing_cpulimit_reports_alert_instead_of_limit() {
     local p; p=$(spawn_victim); link_proc "$p"
     ps_cpu "$p" 95 hog
     # Imported by the child Bash that runs the real watchdog.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     command() {
         if [ "${1:-}" = -v ] && [ "${2:-}" = cpulimit ]; then return 1; fi
         builtin command "$@"
