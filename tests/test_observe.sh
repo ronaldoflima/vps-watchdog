@@ -130,6 +130,8 @@ test_observe_counters_do_not_trigger_actions_when_activating() {
     run_watchdog
     assert_eq '' "$(calls cpulimit)" '(active starts with its own first sample)'
     run_watchdog
+    assert_eq '' "$(calls cpulimit)" '(only one complete active interval)'
+    run_watchdog
     assert_contains "$(calls cpulimit)" "-p $p -l 50"
 }
 

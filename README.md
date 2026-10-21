@@ -25,7 +25,7 @@ toward development workloads; see [Configuring for your workload](#configuring-f
 Four layers, all configurable in `/etc/cpu-watchdog.conf`:
 
 - **Layer 1 — single process**: if a process sustains `CPU_THRESHOLD`% CPU
-  (relative to one core) for `SUSTAIN_CHECKS` consecutive minutes, it is limited
+  (relative to one core, measured between `/proc` samples) for `SUSTAIN_CHECKS` consecutive intervals, it is limited
   to `LIMIT_PERCENT`%.
 - **Layer 2 — aggregate usage**: handles multiple moderately busy processes
   that together overload the host without any one crossing the Layer 1 threshold.
@@ -417,3 +417,21 @@ policies are configurable so they can be adapted to other hosts.
 ## License
 
 [MIT](LICENSE).
+
+### Interval measurements and throttle updates
+
+All CPU layers use per-process CPU time deltas between two valid `/proc`
+samples, keyed by PID and start time. A first sample, a new process or a reused
+PID cannot trigger CPU action without a matching previous sample. Individual
+CPU thresholds count complete sampled intervals, rather than lifetime `ps`
+averages. Existing CPU ceilings and whitelist policy remain unchanged.
+
+Under sustained aggregate pressure, an existing individual throttle can be
+replaced by a stricter aggregate limit. Limits are never relaxed by that path.
+The old systemd scope is stopped before replacement; if stopping fails, the
+existing limit remains tracked. Replacing a limit resets its idle-release count.
+
+High swap occupancy only triggers a memory warning when available RAM is also
+at or below `MEM_SWAP_WARN_AVAIL_PCT` (default 30%). Low available RAM still
+warns independently. Process identities are rechecked before signals; these
+shell checks narrow PID-reuse races but are not atomic pidfd operations.

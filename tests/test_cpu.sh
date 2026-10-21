@@ -67,6 +67,7 @@ agg_busy() { advance_cpu 19200 4800; }
 agg_calm() { advance_cpu 1200 22800; }
 
 test_aggregate_ignores_high_lifetime_pcpu_when_machine_is_idle() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local a b c d
     a=$(spawn_victim a); b=$(spawn_victim b); c=$(spawn_victim c); d=$(spawn_victim d)
     link_proc "$a" "$b" "$c" "$d"
@@ -78,6 +79,7 @@ test_aggregate_ignores_high_lifetime_pcpu_when_machine_is_idle() {
 }
 
 test_aggregate_real_load_throttles_recent_top_consumers_up_to_limit() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local a b c d cl
     a=$(spawn_victim a); b=$(spawn_victim b); c=$(spawn_victim c); d=$(spawn_victim d)
     fake_proc "$a" w1 0; fake_proc "$b" w2 0; fake_proc "$c" w3 0; fake_proc "$d" w4 0
@@ -99,6 +101,7 @@ test_aggregate_real_load_throttles_recent_top_consumers_up_to_limit() {
 }
 
 test_aggregate_below_threshold_does_nothing() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local a b i
     a=$(spawn_victim a); b=$(spawn_victim b)
     fake_proc "$a" w1 0; fake_proc "$b" w2 0
@@ -113,6 +116,7 @@ test_aggregate_below_threshold_does_nothing() {
 }
 
 test_aggregate_requires_sustained_real_load() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local a; a=$(spawn_victim a)
     fake_proc "$a" w1 0
     advance_cpu 0 0; run_watchdog
@@ -124,6 +128,7 @@ test_aggregate_requires_sustained_real_load() {
 }
 
 test_aggregate_skips_kernel_threads_new_and_reused_processes() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local kt reused hog young
     kt=$(spawn_victim kt); reused=$(spawn_victim reused); hog=$(spawn_victim hog); young=$(spawn_victim young)
     fake_proc "$kt" kworker 0 2097152
@@ -146,6 +151,7 @@ test_aggregate_skips_kernel_threads_new_and_reused_processes() {
 }
 
 test_aggregate_skips_whitelisted_and_processes_below_limit() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local ssh low hog
     ssh=$(spawn_victim ssh); low=$(spawn_victim low); hog=$(spawn_victim hog)
     fake_proc "$ssh" sshd 0; fake_proc "$low" small 0; fake_proc "$hog" hog 0
@@ -161,6 +167,7 @@ test_aggregate_skips_whitelisted_and_processes_below_limit() {
 }
 
 test_aggregate_does_not_count_steal_as_busy() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local hog i
     hog=$(spawn_victim hog)
     fake_proc "$hog" hog 0
@@ -175,6 +182,7 @@ test_aggregate_does_not_count_steal_as_busy() {
 }
 
 test_aggregate_without_proc_stat_is_inactive_and_quiet() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local a; a=$(spawn_victim a); link_proc "$a"
     ps_cpu "$a" 79 w1
     run_watchdog; run_watchdog; run_watchdog
@@ -184,6 +192,7 @@ test_aggregate_without_proc_stat_is_inactive_and_quiet() {
 }
 
 test_aggregate_counter_reset_does_not_fire_or_crash() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local hog i
     hog=$(spawn_victim hog)
     fake_proc "$hog" hog 0
@@ -200,6 +209,7 @@ test_aggregate_counter_reset_does_not_fire_or_crash() {
 }
 
 test_aggregate_handles_comm_with_spaces_and_parentheses() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local hog i
     hog=$(spawn_victim hog)
     fake_proc "$hog" "my (odd) name" 0
@@ -212,6 +222,7 @@ test_aggregate_handles_comm_with_spaces_and_parentheses() {
 }
 
 test_aggregate_sanitizes_control_chars_in_comm_and_keeps_process_visible() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local hog i
     hog=$(spawn_victim hog)
     fake_proc "$hog" $'evil)\n7 (x\t\033[31m' 0
@@ -225,6 +236,7 @@ test_aggregate_sanitizes_control_chars_in_comm_and_keeps_process_visible() {
 }
 
 test_aggregate_ignores_corrupt_sample_file() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local hog
     hog=$(spawn_victim hog)
     fake_proc "$hog" hog 0
@@ -236,6 +248,7 @@ test_aggregate_ignores_corrupt_sample_file() {
 }
 
 test_aggregate_high_without_candidates_logs_and_does_nothing() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000' write_conf
     local a b i
     a=$(spawn_victim a); b=$(spawn_victim b)
     fake_proc "$a" w1 0; fake_proc "$b" w2 0
@@ -263,6 +276,7 @@ test_idle_throttled_process_is_released_and_not_relimited() {
     ps_cpu "$p" 95 hog
     run_watchdog; run_watchdog
     assert_contains "$(calls cpulimit)" "-p $p -l 50 -z"
+    : >"$T/ps_cpu"; ps_cpu "$p" 0 hog
     run_watchdog
     assert_eq "" "$(log_content | grep RELEASE || true)" "(one idle measurement out of two)"
     run_watchdog

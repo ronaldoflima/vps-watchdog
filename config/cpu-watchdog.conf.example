@@ -4,7 +4,7 @@
 # Observe does not stop existing throttles or the independent earlyoom daemon.
 MODE=active
 
-# CPU_THRESHOLD: %CPU relative to one core (ps -o %cpu), above which a
+# CPU_THRESHOLD: %CPU relative to one core (measured between /proc samples), above which a
 #                process is counted as consuming too much CPU.
 CPU_THRESHOLD=80
 
@@ -70,8 +70,7 @@ AGG_LIMIT_PERCENT=20
 # cpu-watchdog-ctl unthrottle).
 RELEASE_SUSTAIN_CHECKS=3
 RELEASE_IDLE_PCT=50
-# After release, exempt the process for this many minutes (ps %CPU is a
-# lifetime average that could otherwise trigger unnecessary throttling again).
+# After release, exempt the process for this many minutes to avoid churn.
 RELEASE_GRACE_MIN=30
 
 # --- Layer 3: fork bomb (identical copies of the same command) ---
@@ -119,3 +118,6 @@ MEM_PREFER_FIRST_REGEX="node_modules/[.]bin/(vite|vitest|jest|webpack|playwright
 # NOT included (exempt from CPU throttling but eligible for memory kills).
 # WHITELIST_CMDLINE also applies here.
 MEM_WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn systemd-network dbus-daemon cron crond atop cpulimit cpu-watchdog.sh ps earlyoom dockerd containerd containerd-shim docker-proxy postgres qdrant ollama tailscaled nginx apache2 php-fpm8.3 php-fpm supervisord s6-supervise fail2ban-server agetty"
+
+# Alert on high swap occupancy only when available RAM is also <= this %.
+MEM_SWAP_WARN_AVAIL_PCT=30
