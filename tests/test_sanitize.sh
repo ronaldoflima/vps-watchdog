@@ -236,8 +236,8 @@ test_huge_number_of_args_is_bounded() {
 test_log_and_state_are_private() {
     EXTRA_CONF="$ACT_NOW" write_conf
     rmdir "$T/state"
-    local p; p=$(spawn_victim); link_proc "$p"
-    ps_cpu "$p" 99 app
+    # Generate a memory warning without precreating CPU sample fixtures.
+    set_meminfo 8000000 1200000 2000000 1800000
     (umask 022; run_watchdog)
     assert_eq 600 "$(stat -c %a "$T/watchdog.log")" "(log permissions)"
     assert_eq 700 "$(stat -c %a "$T/state")" "(STATE_DIR permissions)"

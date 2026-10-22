@@ -13,6 +13,41 @@ fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHANGED=0
+REPLACE_EARLYOOM=0
+REQUESTED_MODE=""
+for arg in "$@"; do
+    case "$arg" in
+        --replace-earlyoom) REPLACE_EARLYOOM=1 ;;
+        --mode=active|--mode=observe) REQUESTED_MODE="${arg#*=}" ;;
+        *) echo "Usage: sudo ./install.sh [--mode=active|--mode=observe] [--replace-earlyoom]" >&2; exit 2 ;;
+    esac
+done
+INSTALL_MODE=active
+if [ -f /etc/cpu-watchdog.conf ]; then
+    # shellcheck disable=SC1091
+    INSTALL_MODE=$(MODE=active; source /etc/cpu-watchdog.conf; printf '%s' "$MODE")
+fi
+INSTALL_MODE="${REQUESTED_MODE:-$INSTALL_MODE}"
+case "$INSTALL_MODE" in active|observe) ;; *) echo "Invalid MODE: $INSTALL_MODE" >&2; exit 2 ;; esac
+if [ "$INSTALL_MODE" = observe ] && [ "$REPLACE_EARLYOOM" -eq 1 ]; then
+    echo "--replace-earlyoom is incompatible with observation installation" >&2
+    exit 2
+fi
+
+set_requested_mode() {
+    # Append the authoritative assignment after valid exported/indented settings.
+    # Keeping the final assignment avoids rewriting unrelated custom policy.
+    if [ "$(tail -n 1 /etc/cpu-watchdog.conf)" != "MODE=$INSTALL_MODE" ]; then
+        printf '\nMODE=%s\n' "$INSTALL_MODE" >>/etc/cpu-watchdog.conf
+    fi
+}
+
+# Select observation before replacing scripts or installing dependencies.
+# MODE-aware installed versions honor it on later runs; older versions ignore
+# MODE until replacement. Already-running active invocations are not undone.
+if [ "$REQUESTED_MODE" = observe ] && [ -f /etc/cpu-watchdog.conf ]; then
+    set_requested_mode
+fi
 
 install_if_changed() {
     local src="$1" dest="$2" mode="${3:-644}"
@@ -52,7 +87,9 @@ else
             ;;
     esac
 fi
-if command -v earlyoom >/dev/null 2>&1; then
+if [ "$INSTALL_MODE" = observe ]; then
+    echo "  observe: skipping earlyoom package installation (packages can start the daemon)."
+elif command -v earlyoom >/dev/null 2>&1; then
     echo "  earlyoom ok"
 else
     echo "  installing earlyoom..."
@@ -81,21 +118,35 @@ echo "==> systemd units"
 install_if_changed "$REPO_DIR/systemd/cpu-watchdog.service" /etc/systemd/system/cpu-watchdog.service
 install_if_changed "$REPO_DIR/systemd/cpu-watchdog.timer" /etc/systemd/system/cpu-watchdog.timer
 
-echo "==> earlyoom (Layer 4: sudden memory spikes)"
-EARLYOOM_CHANGED=0
-if ! cmp -s "$REPO_DIR/config/earlyoom.default" /etc/default/earlyoom; then
-    install -m 644 "$REPO_DIR/config/earlyoom.default" /etc/default/earlyoom
-    echo "  updated:  /etc/default/earlyoom"
-    EARLYOOM_CHANGED=1
+echo "==> earlyoom (independent daemon)"
+if [ "$INSTALL_MODE" = observe ]; then
+    echo "  observe: not configuring, enabling or restarting earlyoom."
+    echo "  WARNING: an already-running earlyoom can still terminate processes; MODE does not control it."
 else
-    echo "  unchanged: /etc/default/earlyoom"
-fi
-systemctl enable --now earlyoom >/dev/null 2>&1
-if [ "$EARLYOOM_CHANGED" -eq 1 ]; then
-    systemctl restart earlyoom
+    EARLYOOM_CHANGED=0
+    if [ -e /etc/default/earlyoom ] || [ -L /etc/default/earlyoom ]; then
+        if cmp -s "$REPO_DIR/config/earlyoom.default" /etc/default/earlyoom; then
+            echo "  unchanged: /etc/default/earlyoom"
+        elif [ "$REPLACE_EARLYOOM" -eq 1 ]; then
+            backup=$(mktemp /etc/default/earlyoom.backup.XXXXXXXX)
+            cp -p /etc/default/earlyoom "$backup"
+            echo "  backup: $backup"
+            install -m 644 "$REPO_DIR/config/earlyoom.default" /etc/default/earlyoom
+            EARLYOOM_CHANGED=1
+        else
+            echo "  preserving existing /etc/default/earlyoom; use --replace-earlyoom to back up and replace explicitly."
+        fi
+    else
+        install -D -m 644 "$REPO_DIR/config/earlyoom.default" /etc/default/earlyoom
+        EARLYOOM_CHANGED=1
+    fi
+    systemctl enable --now earlyoom >/dev/null 2>&1
+    if [ "$EARLYOOM_CHANGED" -eq 1 ]; then
+        systemctl restart earlyoom
+    fi
 fi
 
-if systemctl cat tailscaled.service >/dev/null 2>&1; then
+if [ "$INSTALL_MODE" = active ] && systemctl cat tailscaled.service >/dev/null 2>&1; then
     install_if_changed "$REPO_DIR/systemd/tailscaled-oom.conf" /etc/systemd/system/tailscaled.service.d/oom.conf
     # Apply live without restarting tailscaled, which would interrupt remote access.
     for p in $(pgrep -x tailscaled || true); do
@@ -120,6 +171,10 @@ else
     diff -u <(redact /etc/cpu-watchdog.conf) <(redact "$REPO_DIR/config/cpu-watchdog.conf.example") || true
 fi
 
+if [ -n "$REQUESTED_MODE" ]; then
+    set_requested_mode
+fi
+
 echo "==> State"
 mkdir -p /var/lib/cpu-watchdog
 touch /var/lib/cpu-watchdog/counts.tsv /var/lib/cpu-watchdog/limited.tsv
@@ -139,6 +194,7 @@ echo "==> Summary"
 (
     # shellcheck disable=SC1091
     source /etc/cpu-watchdog.conf
+    echo "  Mode:                     $INSTALL_MODE (observe logs proposed actions only; existing throttles and earlyoom remain independent)"
     echo "  Config:                   /etc/cpu-watchdog.conf"
     echo "  Layer 1 (single process): ${CPU_THRESHOLD}% CPU for ${SUSTAIN_CHECKS}min -> throttle to ${LIMIT_PERCENT}%"
     echo "  Layer 2 (aggregate usage):   ${AGG_CPU_THRESHOLD_PCT}% of total capacity for ${AGG_SUSTAIN_CHECKS}min -> throttle top ${AGG_TOP_N} to ${AGG_LIMIT_PERCENT}%"

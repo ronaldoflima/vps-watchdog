@@ -68,6 +68,9 @@ setup_env() {
     : >"$T/ps_mem"
     : >"$T/victims"
     CPU_USER=0; CPU_IDLE=0; CPU_STEAL=0
+    AUTO_CPU=0
+    unset AUTO_TICKS
+    declare -gA AUTO_TICKS=()
     set_meminfo 8000000 4000000 2000000 1800000
     echo "some avg10=0.00 avg60=0.00 avg300=0.00 total=0" >"$T/proc/pressure/memory"
     write_conf
@@ -143,7 +146,42 @@ fake_proc() {
     printf '%s\0' "$comm" >"$T/proc/$pid/cmdline"
 }
 
+# Legacy CPU fixtures describe interval usage in ps_cpu. Translate them into
+# cumulative fake /proc counters; production no longer reads ps %CPU.
+# Tests using explicit advance_cpu/fake_proc bypass this compatibility fixture.
+prepare_cpu_fixture() {
+    local pid usage comm ticks start sample_dir
+    if [ ! -e "$T/proc/stat" ] && [ -s "$T/ps_cpu" ]; then
+        AUTO_CPU=1
+        sample_dir="$T/state"
+        if [[ $(<"$T/conf") == *MODE=observe* ]]; then sample_dir+="/observe"; fi
+        mkdir -p "$sample_dir"
+        printf '0\t0\n' >"$sample_dir/agg_sample.tsv"
+        while read -r pid usage comm; do
+            start=$(awk '{sub(/^.*\) /, ""); print $20}' "$T/proc/$pid/stat")
+            AUTO_TICKS["$pid"]=0
+            rm "$T/proc/$pid"
+            fake_proc "$pid" "$comm" 0 4194560 "$start"
+            ln -s "/proc/$pid/cmdline" "$T/proc/$pid/cmdline.real"
+            mv -f "$T/proc/$pid/cmdline.real" "$T/proc/$pid/cmdline"
+            printf '%s:%s\t0\t%s\n' "$pid" "$start" "$comm" >>"$sample_dir/agg_sample.tsv"
+        done <"$T/ps_cpu"
+    fi
+    if [ "$AUTO_CPU" -eq 1 ]; then
+        advance_cpu 0 24000
+        while read -r pid usage comm; do
+            ticks=$(( ${AUTO_TICKS[$pid]:-0} + usage * 60 ))
+            AUTO_TICKS["$pid"]="$ticks"
+            start=$(awk '{sub(/^.*\) /, ""); print $20}' "$T/proc/$pid/stat")
+            # Preserve real cmdline while rewriting only stat.
+            printf '%s (%s) S 1 1 1 0 -1 4194560 0 0 0 0 %s 0 0 0 20 0 1 0 %s 0 0\n' \
+                "$pid" "$comm" "$ticks" "$start" >"$T/proc/$pid/stat"
+        done <"$T/ps_cpu"
+    fi
+}
+
 run_watchdog() {
+    prepare_cpu_fixture
     PATH="$STUBS_DIR:$PATH" \
     STUB_DIR="$T" \
     CPU_WATCHDOG_CONF="$T/conf" \

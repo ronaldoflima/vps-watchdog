@@ -25,7 +25,7 @@ toward development workloads; see [Configuring for your workload](#configuring-f
 Four layers, all configurable in `/etc/cpu-watchdog.conf`:
 
 - **Layer 1 — single process**: if a process sustains `CPU_THRESHOLD`% CPU
-  (relative to one core) for `SUSTAIN_CHECKS` consecutive minutes, it is limited
+  (relative to one core, measured between `/proc` samples) for `SUSTAIN_CHECKS` consecutive intervals, it is limited
   to `LIMIT_PERCENT`%.
 - **Layer 2 — aggregate usage**: handles multiple moderately busy processes
   that together overload the host without any one crossing the Layer 1 threshold.
@@ -123,17 +123,39 @@ starting systemd services inside the container.
 
 ## Installation / updates
 
+Start by observing policy decisions before enabling watchdog actions:
+
 ```bash
-sudo ./install.sh
+sudo ./install.sh --mode=observe
 ```
 
-On **Debian/Ubuntu**, the installer installs missing `cpulimit` and `earlyoom`
-packages through apt.
+This sets `MODE=observe` in the watchdog configuration and starts its timer.
+It does not install, configure, enable or restart earlyoom, or apply the
+Tailscale OOM adjustment. An already-running earlyoom and existing CPU throttles
+remain active; observation does not undo them. An invocation already running in
+active mode can finish its actions. Older installed versions ignore `MODE` until
+the script is replaced: pause their timer and let any current invocation finish
+before upgrading if you need to prevent actions during the installation window.
+Check those independently if you need a host with no resource intervention.
+
+After reviewing the logs and exemptions, explicitly enable actions:
+
+```bash
+sudo ./install.sh --mode=active
+```
+
+Active installation installs missing dependencies and enables earlyoom, which can
+terminate processes independently of the watchdog. Running `sudo ./install.sh`
+without a mode preserves the configured mode; for a new installation or an older
+configuration without `MODE`, it retains the historical active behavior.
+
+On **Debian/Ubuntu**, the installer installs missing `cpulimit` through apt.
+It also installs missing `earlyoom` in active mode; observation skips it.
 
 On **Arch Linux**, keep the system up to date with `sudo pacman -Syu` before
 running the installer. Ensure `diffutils` is installed
 (`sudo pacman -S --needed diffutils`) for file and configuration comparisons.
-The installer installs missing `earlyoom` with
+In active mode, the installer installs missing `earlyoom` with
 `pacman -S --needed --noconfirm earlyoom`, using the current package database.
 `cpulimit` is available from the AUR: install it as your regular user with an
 AUR helper (for example, `yay -S cpulimit`) if you want CPU throttling, then
@@ -152,13 +174,21 @@ The installer is idempotent. Run it again whenever this repository changes:
 - Installs `/etc/cpu-watchdog.conf` from `config/cpu-watchdog.conf.example`
   **only on the first installation**. If the file already exists and is customized
   (for example, Telegram credentials or adjusted thresholds), it is never
-  overwritten. The installer only displays a diff against the repository template,
-  with sensitive values redacted.
-- Installs missing dependencies through apt on Debian/Ubuntu; on Arch,
-  installs `earlyoom` through pacman and prints AUR instructions for `cpulimit`.
-- **Overwrites** `/etc/default/earlyoom` with `config/earlyoom.default` and
-  restarts earlyoom whenever content differs. Back up any customized earlyoom
-  configuration before the first installation.
+  overwritten. An explicit `--mode` selection appends an authoritative mode
+  assignment; other settings remain intact. The installer displays a diff
+  against the repository template, with sensitive values redacted.
+- Installs missing `cpulimit` through apt on Debian/Ubuntu or prints AUR
+  instructions on Arch. Active installation also installs missing `earlyoom`
+  through apt/pacman; observation skips earlyoom installation.
+- **Preserves existing** `/etc/default/earlyoom`, including package-provided and
+  customized policies. In active mode, it installs the example only when the file
+  is absent. To deliberately replace a differing policy, run
+  `sudo ./install.sh --mode=active --replace-earlyoom`: the installer first saves
+  the previous contents and permissions in a unique
+  `/etc/default/earlyoom.backup.XXXXXXXX` file, then installs the example and
+  restarts earlyoom. Repeated replacements keep separate backups. Restore a
+  selected backup to `/etc/default/earlyoom` and restart earlyoom to recover it.
+  Observation installation rejects `--replace-earlyoom`.
 
 Older configurations remain valid: no new variable is required.
 
@@ -192,13 +222,36 @@ configure earlyoom. Review both
 [`config/earlyoom.default`](config/earlyoom.default). See
 [SECURITY.md](SECURITY.md) for configuration permissions and process selection risks.
 
+## Observation mode
+
+Set `MODE=observe` in `/etc/cpu-watchdog.conf` to evaluate the same thresholds and
+exemptions without starting `cpulimit`, sending SIGTERM/SIGKILL, or stopping a
+throttle scope/helper. Proposals appear as `OBSERVE` / `would ...` in logs and,
+when configured, Telegram alerts. Invalid modes fail before policy evaluation;
+configurations without `MODE` remain active for compatibility.
+
+Observation uses separate counters, samples, alert cooldowns and journal cursors
+under `STATE_DIR/observe`, preserving active state. Existing active throttles are
+read for hypothetical release evaluation but are never removed. Proposed memory
+SIGTERM events are not recorded as delivered, so repeated observations do not
+pretend a process ignored SIGTERM and escalate to SIGKILL. Switching back to
+active resumes its own saved state; observation counters do not count toward
+active sustain checks.
+
+This mode controls the watchdog's automatic actions only. It does not stop
+existing limits, earlyoom, kernel OOM handling or manual management commands.
+The installer warns about independent earlyoom activity. Review both policies
+before enabling actions; a CPU whitelist is separate from a memory whitelist.
+
 ## Optional features
 
 - **Telegram alerts**: set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in
   `/etc/cpu-watchdog.conf`. Empty values mean local logging only. Token and
   chat_id are passed to `curl` through stdin, never argv. Messages include the
   process name, PID and action, never the command line.
-- **earlyoom**: installed and configured by `install.sh`. To disable it, run
+- **earlyoom**: an independent daemon installed/enabled by active installation;
+  existing configuration is preserved. Observation installation leaves it alone.
+  To disable it, run
   `sudo systemctl disable --now earlyoom` after installation. Watchdog Layers
   4a/4b remain active; Layer 4c becomes inactive.
 - **tailscaled OOM protection**: if `tailscaled.service` exists, the installer
@@ -364,3 +417,21 @@ policies are configurable so they can be adapted to other hosts.
 ## License
 
 [MIT](LICENSE).
+
+### Interval measurements and throttle updates
+
+All CPU layers use per-process CPU time deltas between two valid `/proc`
+samples, keyed by PID and start time. A first sample, a new process or a reused
+PID cannot trigger CPU action without a matching previous sample. Individual
+CPU thresholds count complete sampled intervals, rather than lifetime `ps`
+averages. Existing CPU ceilings and whitelist policy remain unchanged.
+
+Under sustained aggregate pressure, an existing individual throttle can be
+replaced by a stricter aggregate limit. Limits are never relaxed by that path.
+The old systemd scope is stopped before replacement; if stopping fails, the
+existing limit remains tracked. Replacing a limit resets its idle-release count.
+
+High swap occupancy only triggers a memory warning when available RAM is also
+at or below `MEM_SWAP_WARN_AVAIL_PCT` (default 30%). Low available RAM still
+warns independently. Process identities are rechecked before signals; these
+shell checks narrow PID-reuse races but are not atomic pidfd operations.

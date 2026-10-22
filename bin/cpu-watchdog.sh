@@ -22,13 +22,42 @@ fi
 
 CONF="${CPU_WATCHDOG_CONF:-/etc/cpu-watchdog.conf}"
 
+MODE=active
 # shellcheck source=config/cpu-watchdog.conf.example
 source "$CONF"
+case "$MODE" in
+    active|observe) ;;
+    *) echo "Invalid MODE: $MODE (expected active or observe)" >&2; exit 2 ;;
+esac
 
 # After source: configuration cannot control the lock or /proc.
 LOCK_FILE="${CPU_WATCHDOG_LOCK:-/run/cpu-watchdog.lock}"
 PROC_DIR="${CPU_WATCHDOG_PROC_DIR:-/proc}"
 
+# Both modes share a lock, but observation must never mutate active policy state.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    exit 0
+fi
+if [ "$MODE" = observe ]; then
+    ACTIVE_STATE_DIR="$STATE_DIR"
+    STATE_DIR="$STATE_DIR/observe"
+    mkdir -p "$STATE_DIR"
+    # Snapshot existing throttles for release evaluation, without controlling them.
+    if [ -f "$ACTIVE_STATE_DIR/limited.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/limited.tsv" "$STATE_DIR/limited.tsv"
+    else
+        : >"$STATE_DIR/limited.tsv"
+    fi
+    if [ -f "$ACTIVE_STATE_DIR/released.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/released.tsv" "$STATE_DIR/released.tsv"
+    else
+        : >"$STATE_DIR/released.tsv"
+    fi
+    if [ ! -f "$STATE_DIR/release.tsv" ] && [ -f "$ACTIVE_STATE_DIR/release.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/release.tsv" "$STATE_DIR/release.tsv"
+    fi
+fi
 mkdir -p "$STATE_DIR"
 
 COUNTS_FILE="$STATE_DIR/counts.tsv"
@@ -40,19 +69,15 @@ GRACE_FILE="$STATE_DIR/released.tsv"
 
 touch "$COUNTS_FILE" "$LIMITED_FILE" "$RELEASE_FILE" "$GRACE_FILE"
 
-# Prevent concurrent watchdog runs.
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    exit 0
-fi
-
 log() {
+    if [ "$MODE" = observe ]; then set -- "OBSERVE $*"; fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG_FILE"
     logger -t cpu-watchdog "$*"
 }
 
 notify() {
     local msg="$1"
+    if [ "$MODE" = observe ]; then msg="OBSERVE: $msg"; fi
 
     [ -n "${TELEGRAM_BOT_TOKEN:-}" ] &&
     [ -n "${TELEGRAM_CHAT_ID:-}" ] || return 0
@@ -72,6 +97,10 @@ url = "$(curl_config_escape "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/s
 data = "$(curl_config_escape "chat_id=${TELEGRAM_CHAT_ID}")"
 CURLCFG
 }
+
+if [ "$MODE" = observe ]; then
+    log "MODE observe: proposed actions only; existing throttles are not released. Independent earlyoom may still terminate processes."
+fi
 
 curl_config_escape() {
     local v="$1"
@@ -125,10 +154,18 @@ pid_start_ticks() {
     #
     # comm can contain spaces/parentheses, so strip everything through the
     # last ") ". After that, starttime is field 20.
-    awk '{
-        sub(/^.*\) /, "")
-        print $20
-    }' "$PROC_DIR/$pid/stat" 2>/dev/null
+    awk '{ rec = rec $0 "?" }
+        END {
+            sub(/^.*\) /, "", rec)
+            split(rec, f, " ")
+            if (f[20] ~ /^[0-9]+$/) print f[20]
+        }' "$PROC_DIR/$pid/stat" 2>/dev/null
+}
+
+same_process() {
+    local pid="$1" key="$2" start
+    start=$(pid_start_ticks "$pid") || return 1
+    [ -n "$start" ] && [ "$pid:$start" = "$key" ]
 }
 
 get_cmdline() {
@@ -306,19 +343,19 @@ get_safe_cmdline() {
     sanitize_args "${args[@]}"
 }
 
-declare -A LIMITED
+declare -A LIMITED LIMITS
 
 while IFS=$'\t' read -r key cpulimit_pid limit applied_at reason; do
     if [ -n "${key:-}" ]; then
         LIMITED["$key"]="${cpulimit_pid:-}"
+        LIMITS["$key"]="${limit:-50}"
     fi
 done <"$LIMITED_FILE"
 
 NOW=$(date +%s)
 
 # Processes released due to idle usage are exempt from throttling for
-# RELEASE_GRACE_MIN minutes: ps reports a lifetime CPU average that would
-# otherwise remain high and immediately trigger another throttle.
+# RELEASE_GRACE_MIN minutes to avoid repeatedly limiting short bursts.
 declare -A GRACE
 
 while IFS=$'\t' read -r key until_epoch; do
@@ -338,16 +375,40 @@ apply_throttle() {
     local comm="$4"
     local reason="$5"
 
-    if [ -n "${LIMITED[$key]:-}" ] || [ -n "${GRACE[$key]:-}" ]; then
+    if [ -n "${GRACE[$key]:-}" ]; then
         return 0
     fi
-
-    if [ ! -d "$PROC_DIR/$pid" ]; then
+    same_process "$pid" "$key" || return 1
+    if [ -n "${LIMITED[$key]:-}" ] && [ "${LIMITS[$key]}" -le "$limit" ]; then
         return 0
     fi
 
     local cmdline
     cmdline=$(get_safe_cmdline "$pid" "$comm")
+
+    if [ "$MODE" = observe ]; then
+        if ! command -v cpulimit >/dev/null 2>&1; then
+            log "$reason pid=$pid comm=$comm -> would alert (cpulimit missing) cmd=[$cmdline]"
+            notify "cpu-watchdog: $reason — would alert for '$comm' (pid $pid); cpulimit missing."
+            return 0
+        fi
+        log "$reason pid=$pid comm=$comm -> would limit to ${limit}% cmd=[$cmdline]"
+        notify "cpu-watchdog: $reason — would limit '$comm' (pid $pid) to ${limit}%."
+        return 0
+    fi
+
+    if [ -n "${LIMITED[$key]:-}" ]; then
+        command -v cpulimit >/dev/null 2>&1 || return 1
+        # Stop only the scope belonging to this sampled target identity. Never
+        # signal an old controller PID, which may have been reused.
+        systemctl stop "cpu-watchdog-limit-${key/:/-}.scope" >/dev/null 2>&1 || return 1
+        awk -F'\t' -v key="$key" '$1 != key' "$LIMITED_FILE" >"${LIMITED_FILE}.new"
+        mv "${LIMITED_FILE}.new" "$LIMITED_FILE"
+        unset 'LIMITED[$key]' 'LIMITS[$key]'
+        awk -F'\t' -v key="$key" '$1 != key' "$RELEASE_FILE" >"${RELEASE_FILE}.new"
+        mv "${RELEASE_FILE}.new" "$RELEASE_FILE"
+    fi
+    same_process "$pid" "$key" || return 1
 
     if command -v cpulimit >/dev/null 2>&1; then
         # cpulimit must leave the cpu-watchdog.service cgroup. The service is
@@ -389,6 +450,7 @@ apply_throttle() {
             >>"$LIMITED_FILE"
 
         LIMITED["$key"]="$cl_pid"
+        LIMITS["$key"]="$limit"
 
         log "$reason pid=$pid comm=$comm -> limited to ${limit}% (cpulimit pid=$cl_pid) cmd=[$cmdline]"
 
@@ -405,79 +467,7 @@ full details: ${LOG_FILE}"
 MY_PID=$$
 MY_PPID=$PPID
 
-# Use one snapshot so both CPU layers share the same measurement.
-#
-# Round %CPU to an integer without forking once per process. comm can
-# contain spaces (e.g. "tmux: server"). Reassigning $2 lets awk rebuild
-# $0 while preserving fields after pcpu, so read -r pid pcpu comm gets
-# the full name in its final field. Keeping only the first word broke
-# comm whitelist matching.
-PS_SNAPSHOT=$(
-    ps -eo pid=,pcpu=,comm= --no-headers |
-        awk '{ $2 = int($2 + 0.5); print }'
-)
-
-### Layer 1: single process sustained above CPU_THRESHOLD ###
-
-declare -A OLD_COUNT
-
-while IFS=$'\t' read -r key count; do
-    if [ -n "${key:-}" ]; then
-        OLD_COUNT["$key"]="$count"
-    fi
-done <"$COUNTS_FILE"
-
-: >"${COUNTS_FILE}.new"
-
-while read -r pid pcpu comm; do
-    if [ -z "${pid:-}" ]; then
-        continue
-    fi
-
-    if [ "$pid" = "$MY_PID" ] || [ "$pid" = "$MY_PPID" ]; then
-        continue
-    fi
-
-    if [ "$pid" = "1" ]; then
-        continue
-    fi
-
-    if [ "$pcpu" -lt "$CPU_THRESHOLD" ]; then
-        continue
-    fi
-
-    if is_exempt "$pid" "$comm"; then
-        continue
-    fi
-
-    start=$(pid_start_ticks "$pid") || true
-
-    if [ -z "${start:-}" ]; then
-        continue
-    fi
-
-    key="${pid}:${start}"
-
-    new_count=$(( ${OLD_COUNT[$key]:-0} + 1 ))
-
-    printf '%s\t%s\n' "$key" "$new_count" >>"${COUNTS_FILE}.new"
-
-    if [ "$new_count" -ge "$SUSTAIN_CHECKS" ]; then
-        if ! apply_throttle \
-            "$pid" \
-            "$key" \
-            "$LIMIT_PERCENT" \
-            "$comm" \
-            "THROTTLE cpu=${pcpu}% for >=${SUSTAIN_CHECKS}min"; then
-
-            log "Failed to apply throttle pid=$pid comm=$comm"
-        fi
-    fi
-done <<<"$PS_SNAPSHOT"
-
-mv "${COUNTS_FILE}.new" "$COUNTS_FILE"
-
-### Layer 2: aggregate host usage ###
+### Shared interval CPU sampling ###
 #
 # Measure ACTUAL CPU usage between runs (/proc/stat and per-process
 # utime+stime deltas). ps %CPU is a lifetime average and includes the
@@ -553,7 +543,7 @@ fi
 # with the same pid:starttime (exclude new processes and reused PIDs)
 # and usage above the limit that would be applied.
 agg_top_consumers() {
-    awk -F'\t' -v dtotal="$AGG_D_TOTAL" -v nproc="$NPROC" -v min="$AGG_LIMIT_PERCENT" '
+    awk -F'\t' -v dtotal="$AGG_D_TOTAL" -v nproc="$NPROC" -v min="${1:-$AGG_LIMIT_PERCENT}" '
         NR == FNR { if (FNR > 1) prev[$1] = $2; next }
         $1 in prev {
             used = int(($2 - prev[$1]) * 100 * nproc / dtotal)
@@ -564,6 +554,81 @@ agg_top_consumers() {
         }' "$AGG_SAMPLE_FILE" - <<<"$AGG_PROCS" |
         sort -k1,1 -rn
 }
+
+# Keep the sampled identity alongside each interval measurement.
+declare -A CPU_KEYS
+PS_SNAPSHOT=""
+if [ "$AGG_D_TOTAL" -gt 0 ]; then
+    while read -r used pid comm; do
+        [ -n "${pid:-}" ] || continue
+        PS_SNAPSHOT+="${pid} ${used} ${comm}"$'\n'
+    done < <(agg_top_consumers 0)
+    while IFS=$'\t' read -r key _ticks _comm; do
+        if [ -n "${key:-}" ]; then CPU_KEYS["${key%%:*}"]="$key"; fi
+    done <<<"$AGG_PROCS"
+fi
+
+### Layer 1: single process sustained above CPU_THRESHOLD ###
+
+declare -A OLD_COUNT
+
+while IFS=$'\t' read -r key count; do
+    if [ -n "${key:-}" ]; then
+        OLD_COUNT["$key"]="$count"
+    fi
+done <"$COUNTS_FILE"
+
+: >"${COUNTS_FILE}.new"
+
+while read -r pid pcpu comm; do
+    if [ -z "${pid:-}" ]; then
+        continue
+    fi
+
+    if [ "$pid" = "$MY_PID" ] || [ "$pid" = "$MY_PPID" ]; then
+        continue
+    fi
+
+    if [ "$pid" = "1" ]; then
+        continue
+    fi
+
+    if [ "$pcpu" -lt "$CPU_THRESHOLD" ]; then
+        continue
+    fi
+
+    if is_exempt "$pid" "$comm"; then
+        continue
+    fi
+
+    start=$(pid_start_ticks "$pid") || true
+
+    if [ -z "${start:-}" ] || [ "${CPU_KEYS[$pid]:-}" != "$pid:$start" ]; then
+        continue
+    fi
+
+    key="${pid}:${start}"
+
+    new_count=$(( ${OLD_COUNT[$key]:-0} + 1 ))
+
+    printf '%s\t%s\n' "$key" "$new_count" >>"${COUNTS_FILE}.new"
+
+    if [ "$new_count" -ge "$SUSTAIN_CHECKS" ]; then
+        if ! apply_throttle \
+            "$pid" \
+            "$key" \
+            "$LIMIT_PERCENT" \
+            "$comm" \
+            "THROTTLE cpu=${pcpu}% for ${SUSTAIN_CHECKS} intervals"; then
+
+            log "Failed to apply throttle pid=$pid comm=$comm"
+        fi
+    fi
+done <<<"$PS_SNAPSHOT"
+
+mv "${COUNTS_FILE}.new" "$COUNTS_FILE"
+
+### Layer 2: aggregate host usage ###
 
 old_agg_count=0
 
@@ -617,7 +682,10 @@ if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
 
         key="${pid}:${start}"
 
-        if [ -n "${LIMITED[$key]:-}" ] || [ -n "${GRACE[$key]:-}" ]; then
+        if [ "${CPU_KEYS[$pid]:-}" != "$key" ] || [ -n "${GRACE[$key]:-}" ]; then
+            continue
+        fi
+        if [ -n "${LIMITED[$key]:-}" ] && [ "${LIMITS[$key]}" -le "$AGG_LIMIT_PERCENT" ]; then
             continue
         fi
 
@@ -715,14 +783,20 @@ for cmdline in "${!FB_GROUP_PIDS[@]}"; do
         comm="${FB_GROUP_COMM[$cmdline]}"
         safe_cmdline=$(get_safe_cmdline "${pids%% *}" "$comm")
 
-        log "FORKBOMB $count identical processes ('$comm') sustained >=${FORKBOMB_SUSTAIN_CHECKS}min -> terminating pids=[$pids] cmd=[$safe_cmdline]"
+        if [ "$MODE" = observe ]; then
+            log "FORKBOMB $count identical processes ('$comm') -> would send SIGTERM to pids=[$pids] cmd=[$safe_cmdline]"
+            notify "cpu-watchdog: FORKBOMB — would send SIGTERM to $count identical processes ('$comm')."
+        else
+            log "FORKBOMB $count identical processes ('$comm') sustained >=${FORKBOMB_SUSTAIN_CHECKS}min -> terminating pids=[$pids] cmd=[$safe_cmdline]"
 
-        for kpid in $pids; do
-            kill -TERM "$kpid" 2>/dev/null || true
-        done
+            for kpid in $pids; do
+                same_process "$kpid" "${CPU_KEYS[$kpid]:-}" || continue
+                kill -TERM "$kpid" 2>/dev/null || true
+            done
 
-        notify "🚨 cpu-watchdog: FORKBOMB detected — $count identical processes ('$comm') terminated (SIGTERM).
+            notify "🚨 cpu-watchdog: FORKBOMB detected — $count identical processes ('$comm') terminated (SIGTERM).
 full details: ${LOG_FILE}"
+        fi
     fi
 done
 
@@ -809,10 +883,18 @@ mem_kill() {
     local reason="$5"
     local cmdline
 
-    [ -d "$PROC_DIR/$pid" ] || return 1
+    local expected="${MEM_KEYS[$pid]:-}"
+    [ -n "$expected" ] && same_process "$pid" "$expected" || return 1
 
     cmdline=$(get_safe_cmdline "$pid" "$comm")
 
+    if [ "$MODE" = observe ]; then
+        log "$reason pid=$pid comm=$comm rss=${rss}MB -> would send SIG$sig cmd=[$cmdline]"
+        notify "cpu-watchdog: $reason — would send SIG$sig to '$comm' (pid $pid, ${rss} MB)."
+        return 0
+    fi
+
+    same_process "$pid" "$expected" || return 1
     kill "-$sig" "$pid" 2>/dev/null || return 1
 
     log "$reason pid=$pid comm=$comm rss=${rss}MB -> SIG$sig cmd=[$cmdline]"
@@ -826,6 +908,16 @@ MEM_SNAPSHOT=$(
     ps -eo pid=,rss=,comm= --no-headers |
         awk '{ $2 = int($2 / 1024); print }'
 )
+
+declare -A MEM_KEYS
+while read -r pid rss _comm; do
+    [ -n "${pid:-}" ] || continue
+    if [ "$rss" -lt "${MEM_VICTIM_MIN_MB:-200}" ] && [ "$rss" -lt "$MEM_PROC_KILL_MB" ]; then
+        continue
+    fi
+    start=$(pid_start_ticks "$pid" || true)
+    if [ -n "$start" ]; then MEM_KEYS["$pid"]="$pid:$start"; fi
+done <<<"$MEM_SNAPSHOT"
 
 MEM_TOTAL_KB=$(meminfo_kb MemTotal)
 MEM_AVAIL_KB=$(meminfo_kb MemAvailable)
@@ -897,7 +989,8 @@ while read -r pid rss comm; do
                 "MEM_PROC ignored SIGTERM, still using ${rss}MB" || true
         elif mem_kill "$pid" "$comm" "$rss" TERM \
             "MEM_PROC ${rss}MB >= ${MEM_PROC_KILL_MB}MB for >=${MEM_PROC_SUSTAIN_CHECKS}min"; then
-            termed=1
+            # A proposed SIGTERM is not evidence that a process ignored SIGTERM.
+            if [ "$MODE" = active ]; then termed=1; fi
         fi
     fi
 
@@ -973,7 +1066,8 @@ if [ "$new_sys_count" -ge "$MEM_SYS_SUSTAIN_CHECKS" ]; then
     new_sys_count=0
 elif [ "$MEM_AVAIL_PCT" -le "$MEM_AVAIL_WARN_PCT" ] ||
      { [ "${SWAP_TOTAL_KB:-0}" -gt 0 ] &&
-       [ "$SWAP_USED_PCT" -ge "$MEM_SWAP_USED_WARN_PCT" ]; }; then
+       [ "$SWAP_USED_PCT" -ge "$MEM_SWAP_USED_WARN_PCT" ] &&
+       [ "$MEM_AVAIL_PCT" -le "${MEM_SWAP_WARN_AVAIL_PCT:-30}" ]; }; then
     mem_alert "low memory — ${MEM_STATUS}.
 top: $(mem_top_groups 5)"
 fi
@@ -1011,10 +1105,12 @@ fi
 # RELEASE_SUSTAIN_CHECKS=0 disables automatic release.
 
 proc_cpu_ticks() {
-    awk '{
-        sub(/^.*\) /, "")
-        print $12 + $13
-    }' "$PROC_DIR/$1/stat" 2>/dev/null
+    awk '{ rec = rec $0 "?" }
+        END {
+            sub(/^.*\) /, "", rec)
+            split(rec, f, " ")
+            if (f[12] ~ /^[0-9]+$/ && f[13] ~ /^[0-9]+$/) print f[12] + f[13]
+        }' "$PROC_DIR/$1/stat" 2>/dev/null
 }
 
 declare -A RELEASED
@@ -1065,10 +1161,15 @@ release_idle_throttles() {
         fi
 
         if [ "$idle" -ge "$sustain" ]; then
-            scope="cpu-watchdog-limit-${key/:/-}.scope"
-            if ! systemctl stop "$scope" >/dev/null 2>&1; then
-                kill "$cl_pid" 2>/dev/null || true
+            if [ "$MODE" = observe ]; then
+                log "RELEASE pid=$pid -> would remove throttle: actual usage below ${threshold}% for ${sustain} runs"
+                notify "cpu-watchdog: would remove throttle from pid $pid (low actual usage)."
+                printf '%s\t%s\t%s\t%s\n' "$key" "$ticks" "$NOW" "$idle" >>"${RELEASE_FILE}.new"
+                continue
             fi
+            scope="cpu-watchdog-limit-${key/:/-}.scope"
+            # Keep tracking the throttle if its scope could not be stopped.
+            systemctl stop "$scope" >/dev/null 2>&1 || continue
             RELEASED["$key"]=1
             printf '%s\t%s\n' "$key" "$(( NOW + grace_min * 60 ))" >>"$GRACE_FILE"
             log "RELEASE pid=$pid -> throttle removed: actual usage below ${threshold}% for ${sustain} runs (original reason: ${reason:-?})"
@@ -1108,7 +1209,7 @@ while IFS=$'\t' read -r key cpulimit_pid limit applied_at reason; do
     fi
 
     # Keep entries only if both the target and cpulimit processes still exist.
-    if [ -d "$PROC_DIR/$pid" ] &&
+    if same_process "$pid" "$key" &&
        [ -n "${cpulimit_pid:-}" ] &&
        [ -d "$PROC_DIR/$cpulimit_pid" ]; then
 
