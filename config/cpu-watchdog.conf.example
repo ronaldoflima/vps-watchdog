@@ -49,8 +49,11 @@ LOG_FILE="/var/log/cpu-watchdog.log"
 # and steal.
 
 # AGG_CPU_THRESHOLD_PCT: percentage of TOTAL host capacity (nproc * 100).
-# On 4 vCPUs, 75 means 300% usage summed across all processes.
-AGG_CPU_THRESHOLD_PCT=75
+# On 4 vCPUs, 55 means 220% usage summed across all processes.
+# On VPS plans with CPU credits (e.g. a 60% baseline), keep this below the
+# baseline: above it credits drain and, once empty, the provider caps the
+# whole VPS far below its nominal capacity.
+AGG_CPU_THRESHOLD_PCT=55
 
 # AGG_SUSTAIN_CHECKS: consecutive minutes above the aggregate threshold before acting.
 AGG_SUSTAIN_CHECKS=5
@@ -61,6 +64,12 @@ AGG_SUSTAIN_CHECKS=5
 AGG_TOP_N=5
 AGG_MAX_THROTTLES=5
 AGG_LIMIT_PERCENT=20
+
+# AGG_WHITELIST_COMM: Layer 2 only. When set, it replaces WHITELIST_COMM in
+# this layer, so processes exempt from Layers 1 and 3 (here: claude, codex)
+# can still be throttled when the host as a whole runs hot.
+# WHITELIST_CMDLINE still applies. Comment it out to use WHITELIST_COMM.
+AGG_WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn earlyoom dbus-daemon cron crond atop cpulimit cpu-watchdog.sh ps"
 
 # --- Automatic throttle release ---
 # Measure ACTUAL throttled process usage (utime+stime between runs). Under

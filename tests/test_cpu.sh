@@ -262,6 +262,34 @@ test_aggregate_high_without_candidates_logs_and_does_nothing() {
     assert_contains "$(log_content)" "AGG_HIGH no process above 20%"
 }
 
+test_aggregate_whitelist_replaces_whitelist_comm() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000
+WHITELIST_COMM="sshd systemd hog"
+AGG_WHITELIST_COMM="sshd systemd"' write_conf
+    local hog i
+    hog=$(spawn_victim hog)
+    fake_proc "$hog" hog 0
+    advance_cpu 0 0; run_watchdog
+    for i in 1 2; do
+        agg_busy; fake_proc "$hog" hog $((i * 6000)); run_watchdog
+    done
+    assert_contains "$(calls cpulimit)" "-p $hog -l 20"
+}
+
+test_aggregate_falls_back_to_whitelist_comm() {
+    EXTRA_CONF='CPU_THRESHOLD=1000000
+WHITELIST_COMM="sshd systemd hog"' write_conf
+    local hog i
+    hog=$(spawn_victim hog)
+    fake_proc "$hog" hog 0
+    advance_cpu 0 0; run_watchdog
+    for i in 1 2; do
+        agg_busy; fake_proc "$hog" hog $((i * 6000)); run_watchdog
+    done
+    assert_eq "" "$(calls cpulimit)"
+    assert_contains "$(log_content)" "AGG_HIGH no process above 20%"
+}
+
 test_cpulimit_does_not_hold_watchdog_lock() {
     local p; p=$(spawn_victim); link_proc "$p"
     ps_cpu "$p" 95 hog
@@ -314,6 +342,8 @@ run_test test_aggregate_handles_comm_with_spaces_and_parentheses
 run_test test_aggregate_sanitizes_control_chars_in_comm_and_keeps_process_visible
 run_test test_aggregate_ignores_corrupt_sample_file
 run_test test_aggregate_high_without_candidates_logs_and_does_nothing
+run_test test_aggregate_whitelist_replaces_whitelist_comm
+run_test test_aggregate_falls_back_to_whitelist_comm
 run_test test_cpulimit_does_not_hold_watchdog_lock
 run_test test_idle_throttled_process_is_released_and_not_relimited
 run_test test_release_disabled_keeps_throttle

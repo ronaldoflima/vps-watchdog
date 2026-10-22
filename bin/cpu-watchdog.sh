@@ -145,6 +145,22 @@ is_exempt() {
     is_whitelisted "$comm" || is_whitelisted_cmdline "$pid" "$comm"
 }
 
+# Layer 2 exemption. AGG_WHITELIST_COMM, when set, replaces WHITELIST_COMM so
+# heavy-but-protected processes (e.g. claude, codex) can still be throttled
+# when the host as a whole is burning CPU credits.
+is_agg_exempt() {
+    local pid="$1"
+    local comm="$2"
+
+    if [ -z "${AGG_WHITELIST_COMM+x}" ]; then
+        is_exempt "$pid" "$comm"
+        return
+    fi
+
+    WHITELIST_COMM="$AGG_WHITELIST_COMM" is_whitelisted "$comm" ||
+        is_whitelisted_cmdline "$pid" "$comm"
+}
+
 pid_start_ticks() {
     local pid="$1"
 
@@ -670,7 +686,7 @@ if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
             continue
         fi
 
-        if is_exempt "$pid" "$comm"; then
+        if is_agg_exempt "$pid" "$comm"; then
             continue
         fi
 

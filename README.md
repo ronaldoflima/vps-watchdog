@@ -36,7 +36,10 @@ Four layers, all configurable in `/etc/cpu-watchdog.conf`:
   those that consumed the most CPU in the last minute. Only processes that used
   more than `AGG_LIMIT_PERCENT`% qualify; kernel threads and new processes with
   no previous sample are excluded. The first run, or a run after reboot, only
-  records a sample.
+  records a sample. `AGG_WHITELIST_COMM`, when set, replaces `WHITELIST_COMM`
+  in this layer; the template uses it to keep `claude` and `codex` exempt from
+  Layers 1 and 3 while still letting Layer 2 throttle them. On VPS plans with
+  CPU credits, keep `AGG_CPU_THRESHOLD_PCT` below the plan's baseline.
 - **Automatic release**: throttling is temporary. The watchdog measures the
   throttled process's actual usage (`utime+stime` from `/proc`, rather than the
   lifetime `%CPU` average from `ps`). If usage stays below `RELEASE_IDLE_PCT`%
