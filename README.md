@@ -37,9 +37,18 @@ Four layers, all configurable in `/etc/cpu-watchdog.conf`:
   more than `AGG_LIMIT_PERCENT`% qualify; kernel threads and new processes with
   no previous sample are excluded. The first run, or a run after reboot, only
   records a sample. `AGG_WHITELIST_COMM`, when set, replaces `WHITELIST_COMM`
-  in this layer; the template uses it to keep `claude` and `codex` exempt from
-  Layers 1 and 3 while still letting Layer 2 throttle them. On VPS plans with
-  CPU credits, keep `AGG_CPU_THRESHOLD_PCT` below the plan's baseline.
+  in this layer. On VPS plans with CPU credits, keep `AGG_CPU_THRESHOLD_PCT`
+  below the plan's baseline.
+- **Layer 2b — agent CPU quota**: `cpulimit` throttles with SIGSTOP/SIGCONT,
+  which breaks interactive programs running as a shell's foreground job: the
+  shell treats each stop as Ctrl+Z and takes the terminal back, and the
+  resumed program stops again on SIGTTIN/SIGTTOU. Processes in `AGENT_COMM`
+  are therefore never cpulimited. Each run moves them into `AGENT_SLICE` (one
+  transient scope per process, via systemd), and while Layer 2 is high the
+  whole slice gets `CPUQuota=AGENT_CPU_QUOTA_PCT%`: the kernel scheduler slows
+  them down without sending signals. The cap is removed after
+  `RELEASE_SUSTAIN_CHECKS` runs in which the slice used less than
+  `RELEASE_IDLE_PCT`% of it. `AGENT_CPU_QUOTA_PCT=0` disables it.
 - **Automatic release**: throttling is temporary. The watchdog measures the
   throttled process's actual usage (`utime+stime` from `/proc`, rather than the
   lifetime `%CPU` average from `ps`). If usage stays below `RELEASE_IDLE_PCT`%

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_DIR/calls/busctl"
+[ ! -f "$STUB_DIR/busctl_fail" ]

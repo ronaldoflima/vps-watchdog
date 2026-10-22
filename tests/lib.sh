@@ -187,6 +187,7 @@ run_watchdog() {
     CPU_WATCHDOG_CONF="$T/conf" \
     CPU_WATCHDOG_LOCK="$T/lock" \
     CPU_WATCHDOG_PROC_DIR="$T/proc" \
+    CPU_WATCHDOG_CGROUP_DIR="$T/cgroup" \
         bash "$WATCHDOG" >"$T/stdout" 2>"$T/stderr"
 }
 

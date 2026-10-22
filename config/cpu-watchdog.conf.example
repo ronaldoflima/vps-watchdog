@@ -66,10 +66,24 @@ AGG_MAX_THROTTLES=5
 AGG_LIMIT_PERCENT=20
 
 # AGG_WHITELIST_COMM: Layer 2 only. When set, it replaces WHITELIST_COMM in
-# this layer, so processes exempt from Layers 1 and 3 (here: claude, codex)
-# can still be throttled when the host as a whole runs hot.
-# WHITELIST_CMDLINE still applies. Comment it out to use WHITELIST_COMM.
-AGG_WHITELIST_COMM="sshd systemd systemd-journal systemd-logind systemd-udevd systemd-resolve systemd-timesyn earlyoom dbus-daemon cron crond atop cpulimit cpu-watchdog.sh ps"
+# this layer. WHITELIST_CMDLINE still applies. Unset = use WHITELIST_COMM.
+# Do not use it to expose interactive programs to cpulimit: its
+# SIGSTOP/SIGCONT breaks TUIs running as a shell's foreground job. Use the
+# agent quota below instead.
+#AGG_WHITELIST_COMM="sshd systemd"
+
+# --- Layer 2b: agent CPU quota (cgroup) ---
+# Processes in AGENT_COMM (e.g. interactive coding agents) are never
+# cpulimited. Each run moves them into AGENT_SLICE (a transient systemd
+# scope per process; children started later stay in it). While Layer 2 is
+# high, the whole slice is capped with CPUQuota=AGENT_CPU_QUOTA_PCT% (100 =
+# one core): the kernel scheduler slows them down without signals. The cap
+# is removed after RELEASE_SUSTAIN_CHECKS runs with the slice using less
+# than RELEASE_IDLE_PCT% of it. AGENT_CPU_QUOTA_PCT=0 disables the feature.
+# Requires systemd (busctl, systemctl) and cgroup v2.
+AGENT_COMM="claude codex"
+AGENT_CPU_QUOTA_PCT=350
+#AGENT_SLICE=cpu-watchdog-agents.slice
 
 # --- Automatic throttle release ---
 # Measure ACTUAL throttled process usage (utime+stime between runs). Under
