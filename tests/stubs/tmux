@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_DIR/calls/tmux"
+[ -f "$STUB_DIR/tmux_panes" ] || exit 1
+cat "$STUB_DIR/tmux_panes"

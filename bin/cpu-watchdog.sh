@@ -17,7 +17,7 @@ umask 077
 # no inherited environment can redirect the source below to another file
 # (sudo with env_keep, systemd drop-ins).
 if [ "$(id -u)" -eq 0 ]; then
-    unset CPU_WATCHDOG_CONF CPU_WATCHDOG_LOCK CPU_WATCHDOG_PROC_DIR
+    unset CPU_WATCHDOG_CONF CPU_WATCHDOG_LOCK CPU_WATCHDOG_PROC_DIR CPU_WATCHDOG_CGROUP_DIR
 fi
 
 CONF="${CPU_WATCHDOG_CONF:-/etc/cpu-watchdog.conf}"
@@ -33,6 +33,7 @@ esac
 # After source: configuration cannot control the lock or /proc.
 LOCK_FILE="${CPU_WATCHDOG_LOCK:-/run/cpu-watchdog.lock}"
 PROC_DIR="${CPU_WATCHDOG_PROC_DIR:-/proc}"
+CGROUP_DIR="${CPU_WATCHDOG_CGROUP_DIR:-/sys/fs/cgroup}"
 
 # Both modes share a lock, but observation must never mutate active policy state.
 exec 9>"$LOCK_FILE"
@@ -48,6 +49,9 @@ if [ "$MODE" = observe ]; then
         cp "$ACTIVE_STATE_DIR/limited.tsv" "$STATE_DIR/limited.tsv"
     else
         : >"$STATE_DIR/limited.tsv"
+    fi
+    if [ -f "$ACTIVE_STATE_DIR/freed.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/freed.tsv" "$STATE_DIR/freed.tsv"
     fi
     if [ -f "$ACTIVE_STATE_DIR/released.tsv" ]; then
         cp "$ACTIVE_STATE_DIR/released.tsv" "$STATE_DIR/released.tsv"
@@ -66,6 +70,7 @@ AGG_COUNT_FILE="$STATE_DIR/agg_count"
 AGG_SAMPLE_FILE="$STATE_DIR/agg_sample.tsv"
 RELEASE_FILE="$STATE_DIR/release.tsv"
 GRACE_FILE="$STATE_DIR/released.tsv"
+FREED_FILE="$STATE_DIR/freed.tsv"
 
 touch "$COUNTS_FILE" "$LIMITED_FILE" "$RELEASE_FILE" "$GRACE_FILE"
 
@@ -137,12 +142,28 @@ is_whitelisted_cmdline() {
     get_cmdline "$pid" "$comm" | grep -Eq -- "$WHITELIST_CMDLINE"
 }
 
-# Exempt = whitelisted by comm OR command line.
+# Agent processes (AGENT_COMM) are capped through a cgroup quota (Layer 2b)
+# and never through cpulimit.
+is_agent_comm() {
+    WHITELIST_COMM="${AGENT_COMM:-}" is_whitelisted "$1"
+}
+
+# Released by hand with "cpu-watchdog-ctl free" (pid:starttime in FREED_FILE).
+is_freed() {
+    local start
+
+    [ "${#FREED[@]}" -gt 0 ] || return 1
+    start=$(pid_start_ticks "$1") || return 1
+    [ -n "$start" ] && [ -n "${FREED[$1:$start]:-}" ]
+}
+
+# Exempt = whitelisted by comm OR command line, an agent process, or freed.
 is_exempt() {
     local pid="$1"
     local comm="$2"
 
-    is_whitelisted "$comm" || is_whitelisted_cmdline "$pid" "$comm"
+    is_whitelisted "$comm" || is_whitelisted_cmdline "$pid" "$comm" ||
+        is_agent_comm "$comm" || is_freed "$pid"
 }
 
 # Layer 2 exemption. AGG_WHITELIST_COMM, when set, replaces WHITELIST_COMM so
@@ -158,7 +179,8 @@ is_agg_exempt() {
     fi
 
     WHITELIST_COMM="$AGG_WHITELIST_COMM" is_whitelisted "$comm" ||
-        is_whitelisted_cmdline "$pid" "$comm"
+        is_whitelisted_cmdline "$pid" "$comm" || is_agent_comm "$comm" ||
+        is_freed "$pid"
 }
 
 pid_start_ticks() {
@@ -379,6 +401,16 @@ while IFS=$'\t' read -r key until_epoch; do
         GRACE["$key"]="$until_epoch"
     fi
 done <"$GRACE_FILE"
+
+declare -A FREED=()
+
+if [ -f "$FREED_FILE" ]; then
+    while IFS=$'\t' read -r key; do
+        if [ -n "${key:-}" ]; then
+            FREED["$key"]=1
+        fi
+    done <"$FREED_FILE"
+fi
 
 # Apply cpulimit to a PID unless it is already throttled.
 #
@@ -727,6 +759,122 @@ if [ "$AGG_SAMPLED" -eq 1 ]; then
         mv "${AGG_SAMPLE_FILE}.new" "$AGG_SAMPLE_FILE"
 else
     rm -f "$AGG_SAMPLE_FILE"
+fi
+
+### Layer 2b: agent CPU quota (cgroup) ###
+#
+# cpulimit throttles with SIGSTOP/SIGCONT. An interactive TUI running as the
+# foreground job of a shell breaks under that: the shell treats each stop as
+# Ctrl+Z and takes the terminal back, and the resumed process stops again on
+# SIGTTIN/SIGTTOU. Processes in AGENT_COMM are moved into AGENT_SLICE
+# instead, and while Layer 2 is high the slice is capped with CPUQuota
+# (kernel CFS bandwidth): nothing is signalled, the processes only run
+# slower. The quota is removed once the slice uses less than
+# RELEASE_IDLE_PCT% of it for RELEASE_SUSTAIN_CHECKS consecutive runs.
+
+AGENT_SLICE="${AGENT_SLICE:-cpu-watchdog-agents.slice}"
+AGENT_QUOTA_FILE="$STATE_DIR/agent_quota"
+
+agent_quota_enabled() {
+    [ -n "${AGENT_COMM:-}" ] && [ "${AGENT_CPU_QUOTA_PCT:-0}" -gt 0 ]
+}
+
+# Move agent processes that are not in the slice yet into a transient scope
+# inside it. Children they start afterwards inherit the scope.
+agent_adopt() {
+    local key _ticks comm pid start
+
+    command -v busctl >/dev/null 2>&1 || return 0
+
+    while IFS=$'\t' read -r key _ticks comm; do
+        [ -n "${key:-}" ] || continue
+        is_agent_comm "$comm" || continue
+        [ -z "${FREED[$key]:-}" ] || continue
+        pid="${key%%:*}"
+        start="${key#*:}"
+        if grep -qF "/${AGENT_SLICE}/" "$PROC_DIR/$pid/cgroup" 2>/dev/null; then
+            continue
+        fi
+        if busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+            org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' \
+            "cpu-watchdog-agent-${pid}-${start}.scope" fail \
+            2 PIDs au 1 "$pid" Slice s "$AGENT_SLICE" 0 >/dev/null 2>&1; then
+            log "AGENT_ADOPT pid=$pid comm=$comm -> $AGENT_SLICE"
+        fi
+    done <<<"$AGG_PROCS"
+}
+
+agent_slice_usage_usec() {
+    local cg
+    cg=$(systemctl show -p ControlGroup --value "$AGENT_SLICE" 2>/dev/null) || return 0
+    [ -n "$cg" ] || return 0
+    awk '$1 == "usage_usec" { print $2; exit }' "$CGROUP_DIR$cg/cpu.stat" 2>/dev/null || true
+}
+
+agent_set_quota() {
+    systemctl set-property --runtime "$AGENT_SLICE" "CPUQuota=$1" >/dev/null 2>&1
+}
+
+aq_state=""
+aq_usage=""
+aq_epoch=""
+aq_idle=0
+if [ -r "$AGENT_QUOTA_FILE" ]; then
+    IFS=$'\t' read -r aq_state aq_usage aq_epoch aq_idle <"$AGENT_QUOTA_FILE" || true
+fi
+[[ "${aq_idle:-}" =~ ^[0-9]+$ ]] || aq_idle=0
+
+if agent_quota_enabled; then
+    [ "$MODE" = observe ] || agent_adopt
+
+    if [ "$aq_state" != on ]; then
+        if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
+            if [ "$MODE" = observe ]; then
+                log "AGENT_QUOTA would cap $AGENT_SLICE at ${AGENT_CPU_QUOTA_PCT}% (aggregate usage ${AGG_USAGE}% sustained)"
+                notify "cpu-watchdog: would cap agent processes at ${AGENT_CPU_QUOTA_PCT}% CPU."
+                printf 'on\t%s\t%s\t0\n' "$(agent_slice_usage_usec)" "$NOW" >"$AGENT_QUOTA_FILE"
+            elif agent_set_quota "${AGENT_CPU_QUOTA_PCT}%"; then
+                log "AGENT_QUOTA $AGENT_SLICE capped at ${AGENT_CPU_QUOTA_PCT}% (aggregate usage ${AGG_USAGE}% sustained)"
+                notify "⚠️ cpu-watchdog: aggregate usage ${AGG_USAGE}% sustained — agent processes capped at ${AGENT_CPU_QUOTA_PCT}% CPU."
+                printf 'on\t%s\t%s\t0\n' "$(agent_slice_usage_usec)" "$NOW" >"$AGENT_QUOTA_FILE"
+            else
+                log "ERROR failed to set CPUQuota on $AGENT_SLICE"
+            fi
+        fi
+    else
+        aq_now_usage=$(agent_slice_usage_usec)
+        aq_sustain="${RELEASE_SUSTAIN_CHECKS:-3}"
+        if [[ "$aq_now_usage" =~ ^[0-9]+$ && "${aq_usage:-}" =~ ^[0-9]+$ && "${aq_epoch:-}" =~ ^[0-9]+$ ]] &&
+           [ "$aq_now_usage" -ge "$aq_usage" ]; then
+            aq_elapsed=$(( NOW - aq_epoch ))
+            [ "$aq_elapsed" -ge 1 ] || aq_elapsed=1
+            # usage_usec delta as a percentage of one core.
+            aq_used=$(( (aq_now_usage - aq_usage) / (aq_elapsed * 10000) ))
+            if [ "$aq_used" -lt $(( AGENT_CPU_QUOTA_PCT * ${RELEASE_IDLE_PCT:-50} / 100 )) ]; then
+                aq_idle=$(( aq_idle + 1 ))
+            else
+                aq_idle=0
+            fi
+        fi
+
+        if [ "$aq_sustain" -gt 0 ] && [ "$aq_idle" -ge "$aq_sustain" ]; then
+            if [ "$MODE" = observe ]; then
+                log "AGENT_QUOTA would remove the cap from $AGENT_SLICE (low usage for ${aq_sustain} runs)"
+                rm -f "$AGENT_QUOTA_FILE"
+            elif agent_set_quota ""; then
+                log "AGENT_QUOTA cap removed from $AGENT_SLICE (low usage for ${aq_sustain} runs)"
+                notify "✅ cpu-watchdog: agent CPU cap removed (low usage for ${aq_sustain}min)."
+                rm -f "$AGENT_QUOTA_FILE"
+            fi
+        else
+            printf 'on\t%s\t%s\t%s\n' "$aq_now_usage" "$NOW" "$aq_idle" >"$AGENT_QUOTA_FILE"
+        fi
+    fi
+elif [ "$aq_state" = on ]; then
+    if [ "$MODE" = observe ] || agent_set_quota ""; then
+        log "AGENT_QUOTA disabled -> cap removed from $AGENT_SLICE"
+        rm -f "$AGENT_QUOTA_FILE"
+    fi
 fi
 
 ### Layer 3: fork bomb (identical copies of the same command) ###
@@ -1241,3 +1389,13 @@ while IFS=$'\t' read -r key cpulimit_pid limit applied_at reason; do
 done <"$LIMITED_FILE"
 
 mv "${LIMITED_FILE}.new" "$LIMITED_FILE"
+
+if [ -f "$FREED_FILE" ]; then
+    : >"${FREED_FILE}.new"
+    for key in "${!FREED[@]}"; do
+        if same_process "${key%%:*}" "$key"; then
+            printf '%s\n' "$key" >>"${FREED_FILE}.new"
+        fi
+    done
+    mv "${FREED_FILE}.new" "$FREED_FILE"
+fi

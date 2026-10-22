@@ -2,5 +2,6 @@
 printf '%s\n' "$*" >>"$STUB_DIR/calls/systemctl"
 case "$*" in
     *is-active*earlyoom*) [ -f "$STUB_DIR/earlyoom_active" ] ;;
+    *show*ControlGroup*) cat "$STUB_DIR/agent_cgroup" 2>/dev/null || true ;;
     *) exit 0 ;;
 esac
