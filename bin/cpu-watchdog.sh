@@ -50,6 +50,9 @@ if [ "$MODE" = observe ]; then
     else
         : >"$STATE_DIR/limited.tsv"
     fi
+    if [ -f "$ACTIVE_STATE_DIR/freed.tsv" ]; then
+        cp "$ACTIVE_STATE_DIR/freed.tsv" "$STATE_DIR/freed.tsv"
+    fi
     if [ -f "$ACTIVE_STATE_DIR/released.tsv" ]; then
         cp "$ACTIVE_STATE_DIR/released.tsv" "$STATE_DIR/released.tsv"
     else
@@ -67,6 +70,7 @@ AGG_COUNT_FILE="$STATE_DIR/agg_count"
 AGG_SAMPLE_FILE="$STATE_DIR/agg_sample.tsv"
 RELEASE_FILE="$STATE_DIR/release.tsv"
 GRACE_FILE="$STATE_DIR/released.tsv"
+FREED_FILE="$STATE_DIR/freed.tsv"
 
 touch "$COUNTS_FILE" "$LIMITED_FILE" "$RELEASE_FILE" "$GRACE_FILE"
 
@@ -144,13 +148,22 @@ is_agent_comm() {
     WHITELIST_COMM="${AGENT_COMM:-}" is_whitelisted "$1"
 }
 
-# Exempt = whitelisted by comm OR command line, or an agent process.
+# Released by hand with "cpu-watchdog-ctl free" (pid:starttime in FREED_FILE).
+is_freed() {
+    local start
+
+    [ "${#FREED[@]}" -gt 0 ] || return 1
+    start=$(pid_start_ticks "$1") || return 1
+    [ -n "$start" ] && [ -n "${FREED[$1:$start]:-}" ]
+}
+
+# Exempt = whitelisted by comm OR command line, an agent process, or freed.
 is_exempt() {
     local pid="$1"
     local comm="$2"
 
     is_whitelisted "$comm" || is_whitelisted_cmdline "$pid" "$comm" ||
-        is_agent_comm "$comm"
+        is_agent_comm "$comm" || is_freed "$pid"
 }
 
 # Layer 2 exemption. AGG_WHITELIST_COMM, when set, replaces WHITELIST_COMM so
@@ -166,7 +179,8 @@ is_agg_exempt() {
     fi
 
     WHITELIST_COMM="$AGG_WHITELIST_COMM" is_whitelisted "$comm" ||
-        is_whitelisted_cmdline "$pid" "$comm" || is_agent_comm "$comm"
+        is_whitelisted_cmdline "$pid" "$comm" || is_agent_comm "$comm" ||
+        is_freed "$pid"
 }
 
 pid_start_ticks() {
@@ -387,6 +401,16 @@ while IFS=$'\t' read -r key until_epoch; do
         GRACE["$key"]="$until_epoch"
     fi
 done <"$GRACE_FILE"
+
+declare -A FREED=()
+
+if [ -f "$FREED_FILE" ]; then
+    while IFS=$'\t' read -r key; do
+        if [ -n "${key:-}" ]; then
+            FREED["$key"]=1
+        fi
+    done <"$FREED_FILE"
+fi
 
 # Apply cpulimit to a PID unless it is already throttled.
 #
@@ -765,6 +789,7 @@ agent_adopt() {
     while IFS=$'\t' read -r key _ticks comm; do
         [ -n "${key:-}" ] || continue
         is_agent_comm "$comm" || continue
+        [ -z "${FREED[$key]:-}" ] || continue
         pid="${key%%:*}"
         start="${key#*:}"
         if grep -qF "/${AGENT_SLICE}/" "$PROC_DIR/$pid/cgroup" 2>/dev/null; then
@@ -1364,3 +1389,13 @@ while IFS=$'\t' read -r key cpulimit_pid limit applied_at reason; do
 done <"$LIMITED_FILE"
 
 mv "${LIMITED_FILE}.new" "$LIMITED_FILE"
+
+if [ -f "$FREED_FILE" ]; then
+    : >"${FREED_FILE}.new"
+    for key in "${!FREED[@]}"; do
+        if same_process "${key%%:*}" "$key"; then
+            printf '%s\n' "$key" >>"${FREED_FILE}.new"
+        fi
+    done
+    mv "${FREED_FILE}.new" "$FREED_FILE"
+fi

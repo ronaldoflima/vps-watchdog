@@ -10,6 +10,8 @@
 #   cpu-watchdog-ctl whitelist-cpu <comm>      exempt a process from CPU throttling
 #   cpu-watchdog-ctl whitelist-mem <comm>      exempt a process from memory kills
 #   cpu-watchdog-ctl whitelist-cmdline <regex> exempt by matching the full command line
+#   cpu-watchdog-ctl free <tmux-session> [--undo]
+#                                             lift every limit from a tmux session's processes
 #
 # "comm" = name shown by ps -o comm (e.g. qdrant, node, php8.3).
 set -euo pipefail
@@ -26,6 +28,10 @@ if [ -r "$CONF" ]; then
 fi
 
 LIMITED_FILE="$STATE_DIR/limited.tsv"
+FREED_FILE="$STATE_DIR/freed.tsv"
+AGENT_SLICE="${AGENT_SLICE:-cpu-watchdog-agents.slice}"
+PROC_DIR="${CPU_WATCHDOG_PROC_DIR:-/proc}"
+CGROUP_DIR="${CPU_WATCHDOG_CGROUP_DIR:-/sys/fs/cgroup}"
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -35,7 +41,7 @@ require_root() {
 }
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- configuration read/write ---
@@ -143,6 +149,8 @@ status() {
         echo "  none — no active throttles."
     fi
 
+    agent_status
+
     echo
     echo "----------------------------------------"
     echo "details"
@@ -217,6 +225,133 @@ unthrottle() {
     echo "The entry in $LIMITED_FILE is cleaned up on the next run (within 1 minute)."
 }
 
+# --- agent CPU quota (cgroup) ---
+
+agent_slice_dir() {
+    local cg
+    cg=$(systemctl show -p ControlGroup --value "$AGENT_SLICE" 2>/dev/null) || true
+    [ -n "$cg" ] && [ -d "$CGROUP_DIR$cg" ] && printf '%s' "$CGROUP_DIR$cg"
+}
+
+agent_status() {
+    local dir quota periods throttled freed=0
+
+    echo
+    echo "########################################"
+    echo "# AGENT CPU QUOTA ($AGENT_SLICE)"
+    echo "########################################"
+    if [ "${AGENT_CPU_QUOTA_PCT:-0}" -le 0 ] || [ -z "${AGENT_COMM:-}" ]; then
+        echo "  disabled (AGENT_COMM / AGENT_CPU_QUOTA_PCT)."
+        return 0
+    fi
+    if ! dir=$(agent_slice_dir); then
+        echo "  slice not created yet (no agent process adopted)."
+        return 0
+    fi
+    quota=$(awk '{ print ($1 == "max") ? "none" : int($1 * 100 / $2) "%" }' "$dir/cpu.max" 2>/dev/null || echo "?")
+    periods=$(awk '$1 == "nr_periods" { print $2 }' "$dir/cpu.stat" 2>/dev/null || true)
+    throttled=$(awk '$1 == "nr_throttled" { print $2 }' "$dir/cpu.stat" 2>/dev/null || true)
+    [ -f "$FREED_FILE" ] && freed=$(grep -c . "$FREED_FILE" || true)
+    echo "  cap: $quota  (configured: ${AGENT_CPU_QUOTA_PCT}%)"
+    echo "  throttled periods: ${throttled:-?} of ${periods:-?} since the slice started"
+    echo "  agent processes in the slice: $(cat "$dir"/*.scope/cgroup.procs 2>/dev/null | grep -c . || true)"
+    echo "  freed by hand (cpu-watchdog-ctl free): ${freed:-0}"
+}
+
+# --- free a tmux session ---
+
+proc_start() {
+    awk '{ rec = rec $0 "?" }
+        END { sub(/^.*\) /, "", rec); split(rec, f, " "); if (f[20] ~ /^[0-9]+$/) print f[20] }' \
+        "$PROC_DIR/$1/stat" 2>/dev/null
+}
+
+proc_state() {
+    awk '{ rec = rec $0 "?" }
+        END { sub(/^.*\) /, "", rec); split(rec, f, " "); print f[1] }' "$PROC_DIR/$1/stat" 2>/dev/null
+}
+
+# PIDs of every pane in the session plus all of their descendants.
+session_pids() {
+    local target="$1" user="$2" panes
+    if [ "$user" = "$(id -un)" ]; then
+        panes=$(tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null) || return 1
+    else
+        panes=$(sudo -u "$user" tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null) || return 1
+    fi
+    [ -n "$panes" ] || return 1
+    ps -e -o pid=,ppid= | awk -v roots="$panes" '
+        BEGIN { n = split(roots, r, "\n"); for (i = 1; i <= n; i++) keep[r[i] + 0] = 1 }
+        { parent[$1 + 0] = $2 + 0 }
+        END {
+            do {
+                changed = 0
+                for (p in parent) if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; changed = 1 }
+            } while (changed)
+            for (p in keep) if (p in parent) print p
+        }' | sort -n
+}
+
+free_session() {
+    local target="$1" undo="${2:-}" user pids pid key start comm actions cl_pid lkey
+    require_root
+    user="${TMUX_USER:-${SUDO_USER:-$(id -un)}}"
+
+    if ! pids=$(session_pids "$target" "$user"); then
+        echo "tmux session '$target' not found for user $user (set TMUX_USER for another user)." >&2
+        exit 1
+    fi
+
+    touch "$FREED_FILE"
+
+    if [ "$undo" = "--undo" ]; then
+        local keys=""
+        for pid in $pids; do
+            start=$(proc_start "$pid") || continue
+            [ -n "$start" ] && keys+="$pid:$start"$'\n'
+        done
+        grep -vxF -f <(printf '%s' "$keys") "$FREED_FILE" >"$FREED_FILE.new" || true
+        mv "$FREED_FILE.new" "$FREED_FILE"
+        echo "Session '$target' is back under the watchdog; agents are re-adopted on the next run (within 1 minute)."
+        return 0
+    fi
+
+    for pid in $pids; do
+        start=$(proc_start "$pid") || continue
+        [ -n "$start" ] || continue
+        key="$pid:$start"
+        comm=$(comm_of "$pid")
+        actions=""
+
+        if [ -f "$LIMITED_FILE" ]; then
+            while IFS=$'\t' read -r lkey cl_pid _; do
+                if [ "$lkey" = "$key" ]; then
+                    unthrottle_one "$pid" "${cl_pid:-}" "$key" >/dev/null
+                    actions+=" cpulimit-removed"
+                fi
+            done <"$LIMITED_FILE"
+        fi
+
+        if [ "$(proc_state "$pid")" = T ]; then
+            kill -CONT "$pid" 2>/dev/null && actions+=" resumed"
+        fi
+
+        if grep -qF "/${AGENT_SLICE}/" "$PROC_DIR/$pid/cgroup" 2>/dev/null &&
+           busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+               org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' \
+               "cpu-watchdog-free-${pid}-${start}.scope" fail \
+               2 PIDs au 1 "$pid" Slice s cpu-watchdog-free.slice 0 >/dev/null 2>&1; then
+            actions+=" moved-out-of-agent-slice"
+        fi
+
+        grep -qxF "$key" "$FREED_FILE" || printf '%s\n' "$key" >>"$FREED_FILE"
+        printf '  pid %-8s %-16s%s\n' "$pid" "$comm" "${actions:- no active limit}"
+    done
+
+    echo "Session '$target' freed: these processes are exempt until they exit or 'free $target --undo'."
+    echo "Processes started later in the session are not covered."
+}
+
 # --- interactive menu for users unfamiliar with bash/systemd ---
 
 menu() {
@@ -280,6 +415,10 @@ case "$cmd" in
     whitelist-cmdline)
         [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl whitelist-cmdline <regex>" >&2; exit 2; }
         whitelist_cmdline "$1"
+        ;;
+    free)
+        [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl free <tmux-session> [--undo]" >&2; exit 2; }
+        free_session "$1" "${2:-}"
         ;;
     menu) menu ;;
     -h|--help|help) usage ;;

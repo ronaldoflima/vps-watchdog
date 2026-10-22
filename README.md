@@ -336,7 +336,23 @@ sudo cpu-watchdog-ctl unthrottle <PID>   # target process PID, not the cpulimit 
 sudo cpu-watchdog-ctl unthrottle all     # release all throttles
 ```
 
-This only removes the current throttle. If the process keeps consuming too much
+Lift every limit from the processes of a tmux session (all panes and their
+descendants):
+
+```bash
+sudo cpu-watchdog-ctl free <tmux-session>         # sessions of the sudo caller
+sudo TMUX_USER=alice cpu-watchdog-ctl free work   # another user's tmux server
+sudo cpu-watchdog-ctl free <tmux-session> --undo  # back under the watchdog
+```
+
+For each process it removes an active `cpulimit`, resumes it if stopped,
+moves agent processes out of the agent slice (into `cpu-watchdog-free.slice`)
+and records `pid:starttime` in `freed.tsv`, so later runs neither throttle nor
+re-adopt it. The exemption ends when the process exits; processes started
+later in the session are not covered. `status` also shows the agent quota:
+current cap, throttled periods and how many processes are in the slice.
+
+`unthrottle` only removes the current throttle. If the process keeps consuming too much
 CPU, it will be throttled again on a later run. For a permanent exemption, use
 the whitelist:
 
