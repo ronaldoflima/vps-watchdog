@@ -336,13 +336,15 @@ sudo cpu-watchdog-ctl unthrottle <PID>   # target process PID, not the cpulimit 
 sudo cpu-watchdog-ctl unthrottle all     # release all throttles
 ```
 
-Lift every limit from the processes of a tmux session (all panes and their
-descendants):
+Lift every limit from the processes of a tmux session, window or pane (the
+target's panes and all their descendants):
 
 ```bash
-sudo cpu-watchdog-ctl free <tmux-session>         # sessions of the sudo caller
+sudo cpu-watchdog-ctl free work                   # whole session (sudo caller's tmux)
+sudo cpu-watchdog-ctl free work:2                 # only window 2
+sudo cpu-watchdog-ctl free work:2.1               # only pane 1 of window 2
 sudo TMUX_USER=alice cpu-watchdog-ctl free work   # another user's tmux server
-sudo cpu-watchdog-ctl free <tmux-session> --undo  # back under the watchdog
+sudo cpu-watchdog-ctl free work:2 --undo          # back under the watchdog
 ```
 
 For each process it removes an active `cpulimit`, resumes it if stopped,

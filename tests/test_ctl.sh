@@ -81,7 +81,23 @@ test_free_undo_removes_exemption() {
 
 test_free_unknown_session_fails() {
     run_ctl free nope && fail "should fail without the session"
-    assert_contains "$(cat "$T/stderr")" "tmux session 'nope' not found"
+    assert_contains "$(cat "$T/stderr")" "tmux target 'nope' not found"
+}
+
+test_free_window_lists_only_that_window() {
+    local v; v=$(spawn_victim pane)
+    echo "$v" >"$T/tmux_panes"
+    run_ctl free work:2 || fail "exit != 0: $(cat "$T/stderr")"
+    assert_eq "list-panes -t work:2 -F #{pane_pid}" "$(calls tmux)"
+    assert_contains "$(cat "$T/state/freed.tsv")" "$v:"
+}
+
+test_free_pane_resolves_single_pane() {
+    local v; v=$(spawn_victim pane)
+    echo "$v" >"$T/tmux_panes"
+    run_ctl free work:2.1 || fail "exit != 0: $(cat "$T/stderr")"
+    assert_eq "display-message -p -t work:2.1 #{pane_pid}" "$(calls tmux)"
+    assert_contains "$(cat "$T/state/freed.tsv")" "$v:"
 }
 
 test_watchdog_skips_freed_agent() {
@@ -121,6 +137,8 @@ run_test test_free_removes_cpulimit_throttle
 run_test test_free_moves_agent_out_of_slice
 run_test test_free_undo_removes_exemption
 run_test test_free_unknown_session_fails
+run_test test_free_window_lists_only_that_window
+run_test test_free_pane_resolves_single_pane
 run_test test_watchdog_skips_freed_agent
 run_test test_watchdog_never_cpulimits_freed_process
 run_test test_watchdog_prunes_freed_entries_of_dead_processes

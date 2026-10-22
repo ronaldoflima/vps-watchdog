@@ -10,8 +10,8 @@
 #   cpu-watchdog-ctl whitelist-cpu <comm>      exempt a process from CPU throttling
 #   cpu-watchdog-ctl whitelist-mem <comm>      exempt a process from memory kills
 #   cpu-watchdog-ctl whitelist-cmdline <regex> exempt by matching the full command line
-#   cpu-watchdog-ctl free <tmux-session> [--undo]
-#                                             lift every limit from a tmux session's processes
+#   cpu-watchdog-ctl free <session[:window[.pane]]> [--undo]
+#                                             lift every limit from a tmux target's processes
 #
 # "comm" = name shown by ps -o comm (e.g. qdrant, node, php8.3).
 set -euo pipefail
@@ -271,14 +271,19 @@ proc_state() {
         END { sub(/^.*\) /, "", rec); split(rec, f, " "); print f[1] }' "$PROC_DIR/$1/stat" 2>/dev/null
 }
 
-# PIDs of every pane in the session plus all of their descendants.
+# PIDs of the target's panes plus all of their descendants. The target is a
+# session ("work"), a window ("work:2") or a pane ("work:2.1"); tmux does not
+# allow ":" or "." in session names.
 session_pids() {
     local target="$1" user="$2" panes
-    if [ "$user" = "$(id -un)" ]; then
-        panes=$(tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null) || return 1
-    else
-        panes=$(sudo -u "$user" tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null) || return 1
-    fi
+    local -a tmux_cmd=(tmux) args
+    [ "$user" = "$(id -un)" ] || tmux_cmd=(sudo -u "$user" tmux)
+    case "$target" in
+        *:*.*) args=(display-message -p -t "$target" '#{pane_pid}') ;;
+        *:*) args=(list-panes -t "$target" -F '#{pane_pid}') ;;
+        *) args=(list-panes -s -t "$target" -F '#{pane_pid}') ;;
+    esac
+    panes=$("${tmux_cmd[@]}" "${args[@]}" 2>/dev/null) || return 1
     [ -n "$panes" ] || return 1
     ps -e -o pid=,ppid= | awk -v roots="$panes" '
         BEGIN { n = split(roots, r, "\n"); for (i = 1; i <= n; i++) keep[r[i] + 0] = 1 }
@@ -298,7 +303,7 @@ free_session() {
     user="${TMUX_USER:-${SUDO_USER:-$(id -un)}}"
 
     if ! pids=$(session_pids "$target" "$user"); then
-        echo "tmux session '$target' not found for user $user (set TMUX_USER for another user)." >&2
+        echo "tmux target '$target' not found for user $user (set TMUX_USER for another user)." >&2
         exit 1
     fi
 
@@ -417,7 +422,7 @@ case "$cmd" in
         whitelist_cmdline "$1"
         ;;
     free)
-        [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl free <tmux-session> [--undo]" >&2; exit 2; }
+        [ $# -ge 1 ] || { echo "usage: cpu-watchdog-ctl free <session[:window[.pane]]> [--undo]" >&2; exit 2; }
         free_session "$1" "${2:-}"
         ;;
     menu) menu ;;
