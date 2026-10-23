@@ -32,6 +32,11 @@ PANEL_CONF = os.environ.get("CPU_WATCHDOG_PANEL_CONF", "/etc/cpu-watchdog-panel.
 PROC = os.environ.get("CPU_WATCHDOG_PROC_DIR", "/proc")
 CGROUP = os.environ.get("CPU_WATCHDOG_CGROUP_DIR", "/sys/fs/cgroup")
 TMUX_TMPDIR = os.environ.get("CPU_WATCHDOG_TMUX_TMPDIR", "/tmp")
+FSTAB = os.environ.get("CPU_WATCHDOG_PANEL_FSTAB", "/etc/fstab")
+SWAP_DIR = os.environ.get("CPU_WATCHDOG_PANEL_SWAP_DIR", "/")
+SYSCTL_FILE = os.environ.get("CPU_WATCHDOG_PANEL_SYSCTL", "/etc/sysctl.d/99-zz-cpu-watchdog-panel.conf")
+SWAPFILE_RE = re.compile(r"^swapfile\d*$")
+SWAP_FS = ("ext4", "xfs", "ext3")
 STATIC_DIR = os.environ.get(
     "CPU_WATCHDOG_PANEL_STATIC",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
@@ -900,6 +905,43 @@ def meminfo():
     }
 
 
+def swap_devices():
+    """Entries of /proc/swaps: path, type, size and used in MB, priority."""
+    out = []
+    for line in read_file(os.path.join(PROC, "swaps")).splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 5:
+            out.append({"path": f[0].replace("\\040", " "), "type": f[1], "size_mb": int(f[2]) // 1024,
+                        "used_mb": int(f[3]) // 1024, "priority": int(f[4])})
+    return out
+
+
+def mount_fstype(path):
+    best, fstype = "", ""
+    for line in read_file(os.path.join(PROC, "mounts")).splitlines():
+        f = line.split()
+        if len(f) >= 3 and (path == f[1] or path.startswith(f[1].rstrip("/") + "/")) and len(f[1]) > len(best):
+            best, fstype = f[1], f[2]
+    return fstype
+
+
+def fstab_swap_lines(text):
+    return [l for l in text.splitlines() if l.split()[:1] and not l.lstrip().startswith("#")
+            and len(l.split()) >= 3 and l.split()[2] == "swap"]
+
+
+def fstab_add_swap(text, path):
+    if any(l.split()[0] == path for l in fstab_swap_lines(text)):
+        return text
+    return text.rstrip("\n") + "\n%s none swap sw 0 0\n" % path
+
+
+def fstab_remove_swap(text, path):
+    keep = [l for l in text.splitlines()
+            if not (l.split()[:1] == [path] and len(l.split()) >= 3 and l.split()[2] == "swap")]
+    return "\n".join(keep) + "\n"
+
+
 def proc_extra(pid):
     base = os.path.join(PROC, str(pid))
     try:
@@ -1052,6 +1094,7 @@ class Panel:
             "units": self.units(),
             "allow_reboot": self.conf["PANEL_ALLOW_REBOOT"] == "1",
             "overrides": [{k: v for k, v in o.items() if k != "data"} for o in self.load_overrides()],
+            "swap": self.swap_status(),
             "credits": self.credit_summary(),
             "governor": self.gov,
         }
@@ -1484,6 +1527,12 @@ class Panel:
             self.audit("swap flush (%d MB)" % m["swap_used_mb"])
             rc, out = run(["sh", "-c", "swapoff -a && swapon -a"], timeout=900)
             return self.result(rc, out, "Swap flushed.")
+        if a == "swap_add":
+            return self.swap_add(body)
+        if a == "swap_remove":
+            return self.swap_remove(body)
+        if a == "swappiness":
+            return self.set_swappiness(body)
         if a == "reboot":
             if self.conf["PANEL_ALLOW_REBOOT"] != "1":
                 raise ValueError("reboot disabled (PANEL_ALLOW_REBOOT)")
@@ -1493,6 +1542,95 @@ class Panel:
             threading.Timer(2, lambda: run(["systemctl", "reboot"])).start()
             return {"ok": True, "message": "Rebooting in 2 seconds."}
         raise ValueError("unknown action")
+
+    # --- swap ---
+
+    def swap_status(self):
+        st = os.statvfs(SWAP_DIR)
+        return {
+            "devices": swap_devices(),
+            "dir": SWAP_DIR,
+            "fstype": mount_fstype(SWAP_DIR),
+            "disk_free_gb": round(st.f_bavail * st.f_frsize / 2 ** 30, 1),
+            "disk_total_gb": round(st.f_blocks * st.f_frsize / 2 ** 30, 1),
+            "swappiness": int(read_file(os.path.join(PROC, "sys", "vm", "swappiness"), "60").strip() or 60),
+        }
+
+    def next_swapfile(self):
+        taken = {d["path"] for d in swap_devices()}
+        for i in [""] + [str(n) for n in range(2, 100)]:
+            path = os.path.join(SWAP_DIR, "swapfile" + i)
+            if path not in taken and not os.path.exists(path):
+                return path
+        raise ValueError("no free swapfile name")
+
+    def swap_add(self, body):
+        try:
+            size = int(body.get("size_gb"))
+        except (TypeError, ValueError):
+            raise ValueError("size_gb must be an integer")
+        if not 1 <= size <= 64:
+            raise ValueError("size must be between 1 and 64 GB")
+        info = self.swap_status()
+        if info["fstype"] not in SWAP_FS:
+            raise ValueError("swap files are only created on %s (here: %s)" % (", ".join(SWAP_FS), info["fstype"] or "?"))
+        reserve = max(5.0, info["disk_total_gb"] * 0.10)
+        if info["disk_free_gb"] - size < reserve:
+            raise ValueError("would leave %.1f GB free on disk (keeping at least %.0f GB)" % (
+                info["disk_free_gb"] - size, reserve))
+        path = self.next_swapfile()
+        steps = [["fallocate", "-l", "%dG" % size, path], ["chmod", "600", path], ["mkswap", path], ["swapon", path]]
+        for cmd in steps:
+            rc, out = run(cmd, timeout=600)
+            if rc != 0:
+                run(["swapoff", path])
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise ValueError("%s failed: %s" % (cmd[0], out))
+        original = read_file(FSTAB, "")
+        backup(FSTAB)
+        atomic_write(FSTAB, fstab_add_swap(original, path), 0o644)
+        self.audit("swap add %s %d GB" % (path, size))
+        return {"ok": True, "message": "Added %d GB of swap at %s (persisted in fstab)." % (size, path)}
+
+    def swap_remove(self, body):
+        path = str(body.get("path", ""))
+        dev = next((d for d in swap_devices() if d["path"] == path), None)
+        if dev is None:
+            raise ValueError("%s is not an active swap area" % path)
+        if os.path.dirname(path) != os.path.normpath(SWAP_DIR) or not SWAPFILE_RE.match(os.path.basename(path)):
+            raise ValueError("only swap files named %sswapfileN are managed here" % SWAP_DIR)
+        m = meminfo()
+        if m["mem_avail_mb"] - dev["used_mb"] < 2048:
+            raise ValueError("not enough available RAM to take back %d MB from %s" % (dev["used_mb"], path))
+        self.audit("swap remove %s (%d MB used)" % (path, dev["used_mb"]))
+        rc, out = run(["swapoff", path], timeout=900)
+        if rc != 0:
+            raise ValueError("swapoff failed: %s" % out)
+        original = read_file(FSTAB, "")
+        backup(FSTAB)
+        atomic_write(FSTAB, fstab_remove_swap(original, path), 0o644)
+        try:
+            os.unlink(path)
+        except OSError as e:
+            return {"ok": True, "message": "Swap off and removed from fstab; delete failed: %s" % e}
+        return {"ok": True, "message": "Removed %s (%d MB)." % (path, dev["size_mb"])}
+
+    def set_swappiness(self, body):
+        try:
+            value = int(body.get("value"))
+        except (TypeError, ValueError):
+            raise ValueError("swappiness must be an integer")
+        if not 0 <= value <= 200:
+            raise ValueError("swappiness must be between 0 and 200")
+        rc, out = run(["sysctl", "-w", "vm.swappiness=%d" % value])
+        if rc != 0:
+            raise ValueError("sysctl failed: %s" % out)
+        atomic_write(SYSCTL_FILE, "# Managed by cpu-watchdog-panel\nvm.swappiness=%d\n" % value, 0o644)
+        self.audit("swappiness %d" % value)
+        return {"ok": True, "message": "vm.swappiness=%d (persisted in %s)." % (value, SYSCTL_FILE)}
 
     def kill(self, body):
         try:

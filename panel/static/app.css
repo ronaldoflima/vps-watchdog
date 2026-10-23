@@ -111,6 +111,7 @@ main > section { display: grid; gap: 16px; }
 .row label { min-width: 90px; color: var(--text-2); }
 .row .grow, .grow { flex: 1; min-width: 160px; }
 .spacer { flex: 1; }
+input.narrow { width: 90px; }
 .check { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 13px; }
 .check input { padding: 0; }
 

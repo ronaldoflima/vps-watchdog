@@ -397,8 +397,11 @@ browser:
 - **Config:** every `/etc/cpu-watchdog.conf` setting grouped by layer, validated
   before writing (`bash -n`, types, regexes), with a one-step backup restore;
   earlyoom arguments (rolled back if earlyoom fails to restart).
-- **Services:** start/stop/restart for the units in `PANEL_UNITS`, swap flush
-  and host reboot (requires typing the hostname).
+- **Services:** start/stop/restart for the units in `PANEL_UNITS`, swap
+  management (add or remove `swapfileN` files on the root filesystem, persisted
+  in `/etc/fstab`; set `vm.swappiness`, persisted in
+  `/etc/sysctl.d/99-zz-cpu-watchdog-panel.conf`; flush swap back to RAM) and
+  host reboot (requires typing the hostname).
 
 Any config change, quota change, watchdog pause or tmux `free` can be made
 **temporary** ("for 10 min", "for 1 h", ...). The panel records it in

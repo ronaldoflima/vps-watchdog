@@ -631,8 +631,12 @@ function renderServices() {
           <button class="small" data-unit="${esc(u)}" data-op="stop">Stop</button></td></tr>`;
     }).join("");
   if (document.activeElement !== $("#units-edit")) $("#units-edit").value = status.units.join(" ");
-  const h = status.host;
-  $("#swap-info").textContent = `Swap used ${fmtMB(h.swap_used_mb)} · RAM available ${fmtMB(h.mem_avail_mb)}`;
+  const h = status.host, sw = status.swap;
+  $("#swap-info").textContent = `Used ${fmtMB(h.swap_used_mb)} of ${fmtMB(h.swap_total_mb)} · RAM available ${fmtMB(h.mem_avail_mb)} · disk ${sw.disk_free_gb} GB free of ${sw.disk_total_gb} GB (${sw.fstype})`;
+  $("#swap-devices").innerHTML = `<tr><th>File</th><th class="num">Size</th><th class="num">Used</th><th class="num">Priority</th><th></th></tr>` +
+    (sw.devices.length ? sw.devices.map((d) => `<tr><td class="mono">${esc(d.path)}</td><td class="num">${fmtMB(d.size_mb)}</td><td class="num">${fmtMB(d.used_mb)}</td><td class="num">${d.priority}</td>
+      <td class="actions"><button class="small" data-swap-remove="${esc(d.path)}">Remove</button></td></tr>`).join("") : `<tr><td class="muted" colspan="5">No swap configured.</td></tr>`);
+  if (document.activeElement !== $("#swappiness")) $("#swappiness").value = sw.swappiness;
   $("#reboot-confirm").placeholder = status.hostname;
   $("#reboot-go").disabled = !status.allow_reboot;
 }
@@ -641,6 +645,15 @@ $("#units").addEventListener("click", (e) => {
   if (b) act("/api/action", { action: "unit", unit: b.dataset.unit, op: b.dataset.op }, b.dataset.op === "start" ? null : `${b.dataset.op} ${b.dataset.unit}?`);
 });
 $("#units-save").addEventListener("click", () => act("/api/units", { units: $("#units-edit").value }));
+$("#swap-add").addEventListener("click", () => {
+  const gb = Number($("#swap-size").value);
+  act("/api/action", { action: "swap_add", size_gb: gb }, `Create a ${gb} GB swap file and enable it now?`);
+});
+$("#swap-devices").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-swap-remove]");
+  if (b) act("/api/action", { action: "swap_remove", path: b.dataset.swapRemove }, `Turn off and delete ${b.dataset.swapRemove}? Its pages move back to RAM first, which can take a few minutes.`);
+});
+$("#swappiness-set").addEventListener("click", () => act("/api/action", { action: "swappiness", value: Number($("#swappiness").value) }));
 $("#swap-flush").addEventListener("click", () => act("/api/action", { action: "swap_flush" }, "Flush swap now? This can take a few minutes."));
 $("#reboot-go").addEventListener("click", () => act("/api/action", { action: "reboot", confirm: $("#reboot-confirm").value.trim() }, "Reboot the host now?"));
 

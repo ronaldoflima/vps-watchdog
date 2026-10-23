@@ -273,6 +273,66 @@ class HistoryTests(Fixture):
         self.assertTrue(all(p["busy"] == 80.0 for p in self.p.history(300)))
 
 
+class SwapTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.fake = os.path.join(self.tmp, "proc")
+        os.makedirs(os.path.join(self.fake, "sys", "vm"))
+        with open(os.path.join(self.fake, "swaps"), "w") as f:
+            f.write("Filename\tType\tSize\tUsed\tPriority\n/swapfile file 2097148 2097148 -2\n"
+                    "/swapfile2 file 2097148 1048576 -3\n/dev/sdb2 partition 1048572 0 -4\n")
+        self.mounts("ext4")
+        with open(os.path.join(self.fake, "sys", "vm", "swappiness"), "w") as f:
+            f.write("10\n")
+        self.m.PROC = self.fake
+
+    def tearDown(self):
+        self.m.PROC = "/proc"
+
+    def mounts(self, fstype):
+        with open(os.path.join(self.fake, "mounts"), "w") as f:
+            f.write("/dev/sda1 / %s rw 0 0\ntmpfs /run tmpfs rw 0 0\n" % fstype)
+
+    def test_status_parses_proc_swaps(self):
+        st = self.p.swap_status()
+        self.assertEqual([(d["path"], d["size_mb"], d["used_mb"]) for d in st["devices"]],
+                         [("/swapfile", 2047, 2047), ("/swapfile2", 2047, 1024), ("/dev/sdb2", 1023, 0)])
+        self.assertEqual((st["fstype"], st["swappiness"]), ("ext4", 10))
+
+    def test_fstab_edits(self):
+        text = "UUID=x / ext4 defaults 0 1\n/swapfile none swap sw 0 0\n# /swapfile9 none swap sw 0 0\n"
+        added = self.m.fstab_add_swap(text, "/swapfile3")
+        self.assertTrue(added.endswith("/swapfile3 none swap sw 0 0\n"))
+        self.assertEqual(self.m.fstab_add_swap(added, "/swapfile3"), added)
+        removed = self.m.fstab_remove_swap(added, "/swapfile")
+        self.assertNotIn("\n/swapfile none", "\n" + removed)
+        self.assertIn("UUID=x", removed)
+        self.assertIn("# /swapfile9", removed)
+
+    def test_add_validation(self):
+        for size in (0, 65, "x"):
+            with self.assertRaises(ValueError):
+                self.p.swap_add({"size_gb": size})
+        self.mounts("btrfs")
+        with self.assertRaises(ValueError) as ctx:
+            self.p.swap_add({"size_gb": 1})
+        self.assertIn("btrfs", str(ctx.exception))
+        self.p.swap_status = lambda: {"fstype": "ext4", "disk_free_gb": 15.0, "disk_total_gb": 100.0}
+        with self.assertRaises(ValueError) as ctx:
+            self.p.swap_add({"size_gb": 6})
+        self.assertIn("free on disk", str(ctx.exception))
+
+    def test_remove_only_managed_active_swapfiles(self):
+        for path in ("/swapfile5", "/dev/sdb2", "/etc/passwd"):
+            with self.assertRaises(ValueError):
+                self.p.swap_remove({"path": path})
+
+    def test_swappiness_bounds(self):
+        for v in (-1, 201, "x"):
+            with self.assertRaises(ValueError):
+                self.p.set_swappiness({"value": v})
+
+
 class GovernorTests(Fixture):
     def setUp(self):
         super().setUp()

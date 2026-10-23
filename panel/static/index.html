@@ -199,9 +199,24 @@
       <div class="grid2">
         <div class="card">
           <h3>Swap</h3>
-          <p class="muted small">Moves swapped pages back into RAM (<code>swapoff -a &amp;&amp; swapon -a</code>). Refused unless available RAM exceeds used swap by 2 GB.</p>
-          <p id="swap-info"></p>
-          <button id="swap-flush">Flush swap</button>
+          <p id="swap-info" class="muted small"></p>
+          <table id="swap-devices" class="compact"></table>
+          <div class="row">
+            <label>Add swap file</label>
+            <input id="swap-size" type="number" min="1" max="64" value="4" class="narrow"> GB
+            <button id="swap-add" class="primary">Add</button>
+          </div>
+          <div class="row">
+            <label>Swappiness</label>
+            <input id="swappiness" type="number" min="0" max="200" class="narrow">
+            <button id="swappiness-set">Apply</button>
+            <span class="muted small">0–200 · lower = keep more in RAM</span>
+          </div>
+          <div class="row">
+            <label>Flush</label>
+            <button id="swap-flush">Move swapped pages back to RAM</button>
+          </div>
+          <p class="muted small">Files are created as <code>swapfileN</code> on the root filesystem and persisted in <code>/etc/fstab</code>. Removing or flushing is refused unless available RAM can absorb the used swap with 2 GB to spare.</p>
         </div>
         <div class="card danger">
           <h3>Reboot host</h3>
