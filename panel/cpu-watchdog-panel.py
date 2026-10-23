@@ -611,7 +611,7 @@ class CreditModel:
             "balance_pct": round(bal / cap * 100, 1), "balance_s": round(bal), "capacity_s": round(cap),
             "vcpus": self.n, "baseline_cores": round(self.base, 2), "throttle_cores": round(self.limit, 2),
             "throttled_est": thr, "recover_pct": self.recover * 100, "source": source,
-            "provider_label": self.label, "cap_mode": self.cap_mode,
+            "provider_label": self.label, "cap_mode": self.cap_mode, "replaying": self.backfilling,
             "use_cores": round(use, 2) if use is not None else None,
             "net_per_min": round(rate * 60) if rate is not None else None,
             "burst_full_min": round(bal / (self.n - self.base) / 60) if self.n > self.base else None,
@@ -1441,6 +1441,12 @@ class Panel:
     def governor_file(self):
         return os.path.join(self.state_dir(), "credit-governor")
 
+    def touch_governor_file(self):
+        """Keep the last decision fresh for the watchdog while the model is replaying."""
+        fields = read_file(self.governor_file(), "").split()
+        if len(fields) == 4:
+            atomic_write(self.governor_file(), "%d\t%s\n" % (time.time(), "\t".join(fields[1:])), 0o600)
+
     def governor_decide(self, vals, summary, total_cores, agent_cores):
         """Allowed host CPU and the agent quota (None = uncapped), in cores/percent."""
         c = self.sampler.credits
@@ -1462,7 +1468,11 @@ class Panel:
     def governor_tick(self):
         vals = self.watchdog_values()
         c = self.sampler.credits
-        enabled = vals.get("CREDIT_GOVERNOR") == "1" and c is not None and not c.backfilling
+        if vals.get("CREDIT_GOVERNOR") == "1" and c is not None and c.backfilling:
+            if self.gov.get("enabled"):
+                self.touch_governor_file()
+            return
+        enabled = vals.get("CREDIT_GOVERNOR") == "1" and c is not None
         observe = vals.get("MODE", "active") == "observe"
         if not enabled:
             if self.gov.get("enabled"):

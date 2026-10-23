@@ -483,6 +483,25 @@ class GovernorTests(Fixture):
         self.assertAlmostEqual(allowed, 8.0)
         self.assertIsNone(quota)
 
+    def test_replay_holds_the_last_decision(self):
+        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "1"}})
+        self.p.sampler.credits.balance = self.p.sampler.credits.cap * 0.5
+        self.fill_history(50.0, 300.0)
+        self.p.governor_tick()
+        path = os.path.join(self.state, "credit-governor")
+        before = read(path).split()
+        os.utime(path, (0, 0))
+        with open(path, "w") as f:
+            f.write("1\t%s\n" % "\t".join(before[1:]))
+        self.p.sampler.credits.backfilling = True
+        self.p.governor_tick()
+        after = read(path).split()
+        self.assertEqual(after[1:], before[1:])
+        self.assertGreater(int(after[0]), 1)
+        self.assertEqual(len(self.quotas), 1, "quota is neither released nor changed while replaying")
+        self.assertTrue(self.p.gov["enabled"])
+        self.assertTrue(self.p.sampler.credits.summary()["replaying"])
+
     def test_reserve_settles_balance_above_zero(self):
         allowed, _o, _q = self.decide(20, 1.0, CREDIT_GOV_RESERVE_PCT="20")
         self.assertAlmostEqual(allowed, 4.8)

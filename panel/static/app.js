@@ -133,7 +133,9 @@ $("#tabs").addEventListener("click", (e) => { if (e.target.dataset.tab) setTab(e
 let polling = null;
 async function refresh() {
   try {
+    const wasReplaying = status?.credits?.replaying;
     status = await api("/api/status");
+    if (wasReplaying && !status.credits?.replaying) refreshHistory();
     $("#updated").textContent = "updated " + new Date().toLocaleTimeString();
     render();
   } catch (e) {
@@ -234,6 +236,7 @@ function creditTile(c) {
   else if (c.empty_in_min != null) sub = `draining · empty in ${fmtMin(c.empty_in_min)}`;
   else if (c.full_in_min != null) sub = `refilling · full in ${fmtMin(c.full_in_min)}`;
   else sub = "full";
+  if (c.replaying) return tile({ label: creditLabel(c), value: "…", sub: "replaying the atop history with the new settings" });
   const lvl = c.throttled_est || c.balance_pct < 20 ? "critical" : c.balance_pct < 40 ? "warning" : "good";
   return tile({ label: creditLabel(c), value: fmtPct(c.balance_pct), sub: `${sub}<br>baseline ${c.baseline_cores} cores · using ${c.use_cores ?? "–"}`, lvl, meter: c.balance_pct });
 }
@@ -255,7 +258,7 @@ function renderCreditNote() {
     `Spending more than ${c.baseline_cores} cores drains the balance; less refills it.`,
     c.burst_full_min != null ? `With the current balance all ${c.vcpus} vCPUs can run flat out for ${fmtMin(c.burst_full_min)}.` : "",
     governorText(status.governor),
-    `Source: ${c.backfilling ? "replaying atop history…" : c.source}. ${c.provider_label && c.provider_label !== "Custom" ? c.provider_label : "The provider"} does not expose the real balance to the guest; this follows the configured model.`,
+    `Source: ${c.replaying ? "replaying atop history…" : c.source}. ${c.provider_label && c.provider_label !== "Custom" ? c.provider_label : "The provider"} does not expose the real balance to the guest; this follows the configured model.`,
   ];
   el.textContent = parts.filter(Boolean).join(" ");
 }
@@ -605,7 +608,7 @@ $("#cc-provider").addEventListener("change", () => {
 });
 $("#cc-save").addEventListener("click", async () => {
   const r = await act("/api/credits/config", { values: creditFormValues() }, "Save the CPU-credit settings and replay the history?");
-  if (r) { await loadConfig(); refresh(); setTimeout(refreshHistory, 3000); }
+  if (r) { await loadConfig(); refresh(); }
 });
 
 function cfgInput(e) {
