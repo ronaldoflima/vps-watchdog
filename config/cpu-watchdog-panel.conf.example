@@ -28,23 +28,30 @@ WATCHDOG_CONF=/etc/cpu-watchdog.conf
 WATCHDOG_CTL=/usr/local/bin/cpu-watchdog-ctl
 EARLYOOM_DEFAULT=/etc/default/earlyoom
 
-# Estimated provider CPU credits (token bucket). Defaults follow Hostinger's
-# documented VPS model: earn 60% of the vCPUs per second, a full balance lasts
-# 3 h at 100% on every vCPU, at zero the VM is capped at 30% until the balance
-# is back to 20%. The provider does not expose the real balance: the panel
-# replays recent atop logs on first start, then tracks /proc/stat.
-# Calibrate against a limit the provider confirmed: on one KVM 8 a single
-# documented limit (cap at 50%) matched BASELINE 55, BURST_HOURS 3.1, THROTTLE 50
-# better than the documented defaults. Delete STATE_DIR/panel-credits.json and
-# restart the panel to replay history with new values.
-PANEL_CREDIT_MODEL=1
+# Estimated burstable-CPU credits (token bucket); see README "Burstable CPU credits".
+# Off by default. Providers: none | hostinger | aws-t3 | custom.
+#   hostinger: baseline 60%, a full balance lasts 3 h at 100% on every vCPU,
+#              capped at 30% (40% on 1 vCPU) at zero until back to 20%.
+#   aws-t3:    standard mode; set PANEL_CREDIT_BASELINE_PCT (per vCPU baseline of
+#              the instance size, e.g. 20 for t3.small); holds 24 h of earnings,
+#              capped at the baseline at zero.
+#   custom:    BASELINE_PCT, THROTTLE_PCT and CAP_HOURS are required.
+# The provider does not expose the real balance: the panel replays recent atop
+# logs on first start, then tracks /proc/stat. Any key below overrides the preset;
+# leave it empty to use the preset. After changing them, delete
+# STATE_DIR/panel-credits.json and restart the panel to replay history.
+PANEL_CREDIT_PROVIDER=none
 PANEL_CREDIT_VCPUS=""
-PANEL_CREDIT_BASELINE_PCT=60
-PANEL_CREDIT_THROTTLE_PCT=30
-PANEL_CREDIT_BURST_HOURS=3
-PANEL_CREDIT_RECOVER_PCT=20
+PANEL_CREDIT_BASELINE_PCT=""
+# burst = CAP_HOURS x (vCPUs - baseline cores); accrual = CAP_HOURS x baseline cores
+PANEL_CREDIT_CAP_MODE=""
+PANEL_CREDIT_CAP_HOURS=""
+PANEL_CREDIT_THROTTLE_PCT=""
+PANEL_CREDIT_RECOVER_PCT=""
+# 0 = nothing is earned while usage presses the cap
+PANEL_CREDIT_EARN_WHILE_THROTTLED=""
 PANEL_ATOP_DIR=/var/log/atop
-# History replayed on first start; start it after a quiet period (full balance).
 # Minute history kept for the charts (also seeded from atop on first start).
 PANEL_HISTORY_DAYS=7
+# History replayed on first start; start it after a quiet period (full balance).
 PANEL_CREDIT_REPLAY_HOURS=168

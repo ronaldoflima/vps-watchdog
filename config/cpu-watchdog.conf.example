@@ -86,7 +86,8 @@ AGENT_CPU_QUOTA_PCT=350
 #AGENT_SLICE=cpu-watchdog-agents.slice
 
 # --- Credit governor (requires the web panel, install.sh --with-panel) ---
-# The panel estimates the provider's CPU-credit balance (see README). With
+# The panel estimates the provider's CPU-credit balance when
+# PANEL_CREDIT_PROVIDER is set in cpu-watchdog-panel.conf (see README). With
 # CREDIT_GOVERNOR=1 it sets the agent slice quota every 30 s so the host uses
 # at most baseline + balance / CREDIT_HORIZON_MIN (all vCPUs while the balance
 # allows it), and Layer 2 triggers on that instead of AGG_CPU_THRESHOLD_PCT.

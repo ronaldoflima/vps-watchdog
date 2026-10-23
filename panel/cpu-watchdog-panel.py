@@ -51,12 +51,16 @@ PANEL_DEFAULTS = {
     "PANEL_ALLOW_REBOOT": "1",
     "PANEL_SAMPLE_SEC": "3",
     "PANEL_HISTORY_MIN": "60",
-    "PANEL_CREDIT_MODEL": "1",
+    "PANEL_CREDIT_PROVIDER": "",
+    "PANEL_CREDIT_MODEL": "",
     "PANEL_CREDIT_VCPUS": "",
-    "PANEL_CREDIT_BASELINE_PCT": "60",
-    "PANEL_CREDIT_THROTTLE_PCT": "30",
-    "PANEL_CREDIT_BURST_HOURS": "3",
-    "PANEL_CREDIT_RECOVER_PCT": "20",
+    "PANEL_CREDIT_BASELINE_PCT": "",
+    "PANEL_CREDIT_THROTTLE_PCT": "",
+    "PANEL_CREDIT_CAP_MODE": "",
+    "PANEL_CREDIT_CAP_HOURS": "",
+    "PANEL_CREDIT_BURST_HOURS": "",
+    "PANEL_CREDIT_RECOVER_PCT": "",
+    "PANEL_CREDIT_EARN_WHILE_THROTTLED": "",
     "PANEL_ATOP_DIR": "/var/log/atop",
     "PANEL_CREDIT_REPLAY_HOURS": "168",
     "PANEL_HISTORY_DAYS": "7",
@@ -103,7 +107,8 @@ SCHEMA = [
      "systemd slice holding agent processes."),
     ("Credit governor", "CREDIT_GOVERNOR", "enum:0,1", "0",
      "1 = the panel sizes the agent quota from the estimated credit balance every 30 s "
-     "(Layer 2 then triggers on what the balance can sustain). Needs the panel running."),
+     "(Layer 2 then triggers on what the balance can sustain). Needs the panel running "
+     "with PANEL_CREDIT_PROVIDER set."),
     ("Credit governor", "CREDIT_HORIZON_MIN", "int", "120",
      "Spend the balance over at least this long: allowed CPU = baseline + balance / horizon."),
     ("Credit governor", "CREDIT_GOV_MIN_QUOTA_PCT", "int", "100",
@@ -384,37 +389,133 @@ def busy_seconds(cpu_fields, hz):
     return (f[0] + f[1] + f[2] + f[5] + f[6]) / hz
 
 
+# Burstable-CPU presets, from each provider's documentation. None = must be set
+# explicitly; a callable receives the vCPU count. cap_mode "burst": a full balance
+# lasts cap_hours at 100% on every vCPU (cap = hours x (vCPUs - baseline cores));
+# "accrual": the balance holds cap_hours of baseline earnings (cap = hours x baseline cores).
+CREDIT_PROVIDERS = {
+    "hostinger": {"label": "Hostinger", "baseline_pct": 60, "cap_mode": "burst", "cap_hours": 3,
+                  "throttle_pct": lambda n: 40 if n <= 1 else 30, "recover_pct": 20,
+                  "earn_while_throttled": False},
+    "aws-t3": {"label": "AWS T3", "baseline_pct": None, "cap_mode": "accrual", "cap_hours": 24,
+               "throttle_pct": "baseline", "recover_pct": 0, "earn_while_throttled": True},
+    "custom": {"label": "Custom", "baseline_pct": None, "cap_mode": "burst", "cap_hours": None,
+               "throttle_pct": None, "recover_pct": 0, "earn_while_throttled": True},
+}
+CREDIT_PROVIDER_NAMES = ("none",) + tuple(CREDIT_PROVIDERS)
+
+
+def resolve_credit_conf(conf, nproc):
+    """Provider preset merged with explicit PANEL_CREDIT_* keys.
+
+    Returns {"provider", "label", "enabled", "error", "params"}; params is None when
+    credits are disabled or the configuration is incomplete."""
+    provider = (conf.get("PANEL_CREDIT_PROVIDER") or "").strip().lower()
+    if not provider:
+        provider = "hostinger" if (conf.get("PANEL_CREDIT_MODEL") or "").strip() == "1" else "none"
+    out = {"provider": provider, "label": None, "enabled": False, "error": None, "params": None}
+    if provider == "none":
+        return out
+    preset = CREDIT_PROVIDERS.get(provider)
+    if not preset:
+        out["error"] = "PANEL_CREDIT_PROVIDER: unknown provider %r (use %s)" % (
+            provider, ", ".join(CREDIT_PROVIDER_NAMES))
+        return out
+    out["label"] = preset["label"]
+
+    def explicit(key):
+        return (conf.get(key) or "").strip()
+
+    def number(key, value):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("%s must be a number, got %r" % (key, value))
+        if v < 0:
+            raise ValueError("%s must not be negative" % key)
+        return v
+
+    try:
+        n = number("PANEL_CREDIT_VCPUS", explicit("PANEL_CREDIT_VCPUS") or nproc)
+        if n <= 0:
+            raise ValueError("PANEL_CREDIT_VCPUS must be positive")
+        baseline = explicit("PANEL_CREDIT_BASELINE_PCT") or preset["baseline_pct"]
+        if baseline is None:
+            raise ValueError("provider %s needs PANEL_CREDIT_BASELINE_PCT" % provider)
+        baseline = number("PANEL_CREDIT_BASELINE_PCT", baseline)
+        throttle = explicit("PANEL_CREDIT_THROTTLE_PCT") or preset["throttle_pct"]
+        if throttle == "baseline":
+            throttle = baseline
+        elif callable(throttle):
+            throttle = throttle(n)
+        if throttle is None:
+            raise ValueError("provider %s needs PANEL_CREDIT_THROTTLE_PCT" % provider)
+        throttle = number("PANEL_CREDIT_THROTTLE_PCT", throttle)
+        legacy_burst = explicit("PANEL_CREDIT_BURST_HOURS")
+        mode = explicit("PANEL_CREDIT_CAP_MODE").lower() or ("burst" if legacy_burst else preset["cap_mode"])
+        if mode not in ("burst", "accrual"):
+            raise ValueError("PANEL_CREDIT_CAP_MODE must be burst or accrual, got %r" % mode)
+        hours = explicit("PANEL_CREDIT_CAP_HOURS") or legacy_burst or preset["cap_hours"]
+        if hours is None:
+            raise ValueError("provider %s needs PANEL_CREDIT_CAP_HOURS" % provider)
+        hours = number("PANEL_CREDIT_CAP_HOURS", hours)
+        recover = number("PANEL_CREDIT_RECOVER_PCT", explicit("PANEL_CREDIT_RECOVER_PCT") or preset["recover_pct"])
+        earn = explicit("PANEL_CREDIT_EARN_WHILE_THROTTLED")
+        if earn not in ("", "0", "1"):
+            raise ValueError("PANEL_CREDIT_EARN_WHILE_THROTTLED must be 0 or 1")
+        earn = preset["earn_while_throttled"] if earn == "" else earn == "1"
+        if baseline > 100 or throttle > 100 or recover > 100:
+            raise ValueError("PANEL_CREDIT_*_PCT values must be at most 100")
+        if hours <= 0:
+            raise ValueError("PANEL_CREDIT_CAP_HOURS must be positive")
+    except ValueError as e:
+        out["error"] = str(e)
+        return out
+    out["enabled"] = True
+    out["params"] = {"vcpus": n, "baseline_pct": baseline, "throttle_pct": throttle, "cap_mode": mode,
+                     "cap_hours": hours, "recover_pct": recover, "earn_while_throttled": earn}
+    return out
+
+
 class CreditModel:
-    """Estimate of a provider CPU-credit balance (token bucket, Hostinger's model by default).
+    """Estimate of a provider CPU-credit balance (token bucket).
 
     One credit is one vCPU-second at 100%. The VM earns BASELINE% x vCPUs credits per
-    second and spends the busy core-seconds it actually ran. Capacity is
-    BURST_HOURS x 3600 x (vCPUs - baseline cores), i.e. the time a full balance lasts at
-    100% on every vCPU. At zero the provider caps the VM at THROTTLE% of its vCPUs until
-    the balance is back to RECOVER% of capacity; nothing is earned while the VM is
-    pressing against that cap.
-    The provider does not expose the real balance, so this is an estimate."""
+    second and spends the busy core-seconds it actually ran. Capacity depends on the
+    provider: "burst" mode, CAP_HOURS x 3600 x (vCPUs - baseline cores), the time a full
+    balance lasts at 100% on every vCPU; "accrual" mode, CAP_HOURS x 3600 x baseline
+    cores, i.e. CAP_HOURS of earnings. At zero the provider caps the VM at THROTTLE% of
+    its vCPUs until the balance is back to RECOVER% of capacity; unless
+    EARN_WHILE_THROTTLED, nothing is earned while the VM is pressing against that cap.
+    The provider does not expose the real balance to the guest, so this is an estimate."""
 
-    def __init__(self, conf, nproc, path):
-        self.n = float(conf["PANEL_CREDIT_VCPUS"] or nproc)
-        self.base = self.n * float(conf["PANEL_CREDIT_BASELINE_PCT"]) / 100
-        self.limit = self.n * float(conf["PANEL_CREDIT_THROTTLE_PCT"]) / 100
-        self.cap = float(conf["PANEL_CREDIT_BURST_HOURS"]) * 3600 * max(0.01, self.n - self.base)
-        self.recover = float(conf["PANEL_CREDIT_RECOVER_PCT"]) / 100
+    def __init__(self, params, path, label=None):
+        self.label = label
+        self.n = float(params["vcpus"])
+        self.base = self.n * float(params["baseline_pct"]) / 100
+        self.limit = self.n * float(params["throttle_pct"]) / 100
+        self.cap_mode = params["cap_mode"]
+        if self.cap_mode == "accrual":
+            self.cap = float(params["cap_hours"]) * 3600 * max(0.01, self.base)
+        else:
+            self.cap = float(params["cap_hours"]) * 3600 * max(0.01, self.n - self.base)
+        self.recover = float(params["recover_pct"]) / 100
+        self.earn_while_throttled = bool(params["earn_while_throttled"])
+        self.history_days = int(params.get("history_days") or 7)
         self.path = path
         self.lock = threading.Lock()
         self.balance = self.cap
         self.throttled = False
         self.source = "assumed full (no history yet)"
         self.last = None
-        self.history = collections.deque(maxlen=int(conf.get("PANEL_HISTORY_DAYS") or 7) * 24 * 60)
+        self.history = collections.deque(maxlen=self.history_days * 24 * 60)
         self.recent = collections.deque(maxlen=200)
         self.pending = []
         self.backfilling = False
         self.last_saved = 0
 
     def step(self, consumed, dt):
-        at_cap = self.throttled and consumed / dt >= 0.9 * self.limit
+        at_cap = not self.earn_while_throttled and self.throttled and consumed / dt >= 0.9 * self.limit
         earn = 0.0 if at_cap else self.base * dt
         self.balance = min(self.cap, max(0.0, self.balance + earn - consumed))
         if self.balance <= 0:
@@ -500,6 +601,7 @@ class CreditModel:
             "balance_pct": round(bal / cap * 100, 1), "balance_s": round(bal), "capacity_s": round(cap),
             "vcpus": self.n, "baseline_cores": round(self.base, 2), "throttle_cores": round(self.limit, 2),
             "throttled_est": thr, "recover_pct": self.recover * 100, "source": source,
+            "provider_label": self.label, "cap_mode": self.cap_mode,
             "use_cores": round(use, 2) if use is not None else None,
             "net_per_min": round(rate * 60) if rate is not None else None,
             "burst_full_min": round(bal / (self.n - self.base) / 60) if self.n > self.base else None,
@@ -669,9 +771,13 @@ class Sampler(threading.Thread):
         need_history = not self.minutes.load()
         self.credits = None
         need_credits = False
-        if panel.conf["PANEL_CREDIT_MODEL"] == "1":
-            self.credits = CreditModel(panel.conf, self.nproc,
-                                       os.path.join(panel.state_dir(), "panel-credits.json"))
+        self.credit_conf = resolve_credit_conf(panel.conf, self.nproc)
+        if self.credit_conf["error"]:
+            sys.stderr.write("credits disabled: %s\n" % self.credit_conf["error"])
+        if self.credit_conf["enabled"]:
+            params = dict(self.credit_conf["params"], history_days=panel.conf["PANEL_HISTORY_DAYS"])
+            self.credits = CreditModel(params, os.path.join(panel.state_dir(), "panel-credits.json"),
+                                       self.credit_conf["label"])
             need_credits = not self.credits.load()
             self.credits.backfilling = need_credits
         if need_history or need_credits:
@@ -1095,6 +1201,8 @@ class Panel:
             "allow_reboot": self.conf["PANEL_ALLOW_REBOOT"] == "1",
             "overrides": [{k: v for k, v in o.items() if k != "data"} for o in self.load_overrides()],
             "swap": self.swap_status(),
+            "credit_provider": {k: v for k, v in self.sampler.credit_conf.items() if k != "params"},
+            "credits_enabled": self.sampler.credits is not None,
             "credits": self.credit_summary(),
             "governor": self.gov,
         }
@@ -1161,6 +1269,9 @@ class Panel:
             if SCHEMA_BY_KEY.get(key, ("", "", ""))[2] == "secret" and value == "":
                 continue
             rendered[key] = validate_value(key, value, self.sampler.nproc)
+        if rendered.get("CREDIT_GOVERNOR") == "1" and self.sampler.credits is None:
+            raise ValueError("The credit governor needs a CPU-credit provider: set PANEL_CREDIT_PROVIDER "
+                             "in %s and restart the panel." % PANEL_CONF)
         if not rendered:
             raise ValueError("no changes")
         minutes = duration_minutes(body)

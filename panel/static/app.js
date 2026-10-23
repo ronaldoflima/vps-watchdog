@@ -143,7 +143,7 @@ async function refresh() {
 async function refreshHistory() {
   try {
     samples = await api(`/api/history?range=${range}`);
-    if (status?.credits) creditSamples = await api(`/api/credits?range=${range}`);
+    creditSamples = status?.credits_enabled ? await api(`/api/credits?range=${range}`) : [];
     renderCharts();
   } catch { /* next poll retries */ }
 }
@@ -225,6 +225,8 @@ function tile({ label, value, sub, lvl, meter }) {
 
 const fmtMin = (m) => (m == null ? "–" : m >= 60 ? `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min` : `${m} min`);
 
+const creditLabel = (c) => `CPU credits (${c?.provider_label ? c.provider_label + ", " : ""}est.)`;
+
 function creditTile(c) {
   if (!c) return "";
   let sub;
@@ -233,7 +235,7 @@ function creditTile(c) {
   else if (c.full_in_min != null) sub = `refilling · full in ${fmtMin(c.full_in_min)}`;
   else sub = "full";
   const lvl = c.throttled_est || c.balance_pct < 20 ? "critical" : c.balance_pct < 40 ? "warning" : "good";
-  return tile({ label: "CPU credits (est.)", value: fmtPct(c.balance_pct), sub: `${sub}<br>baseline ${c.baseline_cores} cores · using ${c.use_cores ?? "–"}`, lvl, meter: c.balance_pct });
+  return tile({ label: creditLabel(c), value: fmtPct(c.balance_pct), sub: `${sub}<br>baseline ${c.baseline_cores} cores · using ${c.use_cores ?? "–"}`, lvl, meter: c.balance_pct });
 }
 
 function governorText(g) {
@@ -252,7 +254,7 @@ function renderCreditNote() {
     `Spending more than ${c.baseline_cores} cores drains the balance; less refills it.`,
     c.burst_full_min != null ? `With the current balance all ${c.vcpus} vCPUs can run flat out for ${fmtMin(c.burst_full_min)}.` : "",
     governorText(status.governor),
-    `Source: ${c.backfilling ? "replaying atop history…" : c.source}. Hostinger does not publish the real balance; this follows its documented model.`,
+    `Source: ${c.backfilling ? "replaying atop history…" : c.source}. ${c.provider_label && c.provider_label !== "Custom" ? c.provider_label : "The provider"} does not expose the real balance to the guest; this follows the configured model.`,
   ];
   el.textContent = parts.filter(Boolean).join(" ");
 }
@@ -267,7 +269,7 @@ function renderOverview() {
   const tiles = [
     tile({ label: "Host CPU busy", value: fmtPct(h.busy_pct), sub: `Layer 2 trigger at ${aggThr}% · counter ${w.agg_count}/${th.AGG_SUSTAIN_CHECKS || 5}`, lvl: level(h.busy_pct, aggThr - 10, aggThr), meter: h.busy_pct }),
     tile({ label: "Steal", value: fmtPct(h.steal_pct), sub: "CPU taken by the hypervisor", lvl: level(h.steal_pct, 10, 25) }),
-    creditTile(status.credits),
+    status.credit_provider?.error ? tile({ label: "CPU credits", value: "–", sub: `not estimated: ${esc(status.credit_provider.error)}`, lvl: "warning" }) : creditTile(status.credits),
     tile({ label: "Load average", value: esc((h.load || [])[0] || "–"), sub: `${esc((h.load || []).slice(1).join(" · "))} · ${h.nproc} CPUs`, lvl: level(Number((h.load || [])[0]) / h.nproc * 100, 100, 200) }),
     tile({ label: "Agent slice", value: slUse == null ? "–" : fmtPct(slUse), sub: quota != null ? `quota ${quota}% · ${w.agent_quota_state}` : `uncapped · config ${th.AGENT_CPU_QUOTA_PCT}%`, lvl: quota != null ? level(slUse / quota * 100, 85, 97) : null, meter: quota != null ? slUse / quota * 100 : null }),
     tile({ label: "Agent stall (PSI full)", value: fmtPct(slPsiFull), sub: "time all agents waited for CPU", lvl: level(slPsiFull, 15, 35) }),
@@ -280,6 +282,10 @@ function renderOverview() {
   $("#tiles").innerHTML = tiles.join("");
   $("#groups").innerHTML = `<tr><th>Command</th><th class="num">Processes</th></tr>` +
     status.top_comm.map(([c, n]) => `<tr><td>${esc(c)}</td><td class="num">${n}</td></tr>`).join("");
+  const creditsOn = !!status.credits_enabled;
+  $("#card-credits").hidden = !creditsOn;
+  $("#q-gov-row").hidden = !creditsOn;
+  if (creditsOn) $("#credits-title").textContent = creditLabel(status.credits);
   const g = status.governor;
   $("#gov-state").textContent = g?.enabled ? `on · agent quota ${g.quota_pct == null ? "uncapped" : g.quota_pct + "%"}` : "off";
   $("#q-quota").disabled = !!(g?.enabled && !g.observe);
@@ -309,7 +315,7 @@ function cssVar(name) { return getComputedStyle(document.documentElement).getPro
 
 function renderCharts() {
   if (tab !== "overview") return;
-  for (const [, c] of Object.entries(CHARTS)) drawChart(c);
+  for (const [name, c] of Object.entries(CHARTS)) if (name !== "credits" || status?.credits_enabled) drawChart(c);
   renderCreditNote();
 }
 

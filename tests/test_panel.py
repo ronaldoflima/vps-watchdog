@@ -32,6 +32,8 @@ def load_module(env):
 
 
 class Fixture(unittest.TestCase):
+    PANEL_EXTRA = "PANEL_CREDIT_PROVIDER=hostinger\n"
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.conf = os.path.join(self.tmp, "cpu-watchdog.conf")
@@ -45,7 +47,8 @@ class Fixture(unittest.TestCase):
         self.panel_conf = os.path.join(self.tmp, "panel.conf")
         with open(self.panel_conf, "w") as f:
             f.write('PANEL_TOKEN_FILE=%s/token\nWATCHDOG_CONF=%s\nPANEL_UNITS="a.service bad;unit"\n'
-                    'EARLYOOM_DEFAULT=%s/earlyoom\nWATCHDOG_CTL=/bin/false\nPANEL_ATOP_DIR=%s/no-atop\n' % (self.tmp, self.conf, self.tmp, self.tmp))
+                    'EARLYOOM_DEFAULT=%s/earlyoom\nWATCHDOG_CTL=/bin/false\nPANEL_ATOP_DIR=%s/no-atop\n' % (self.tmp, self.conf, self.tmp, self.tmp)
+                    + self.PANEL_EXTRA)
         self.m = load_module({"CPU_WATCHDOG_PANEL_CONF": self.panel_conf})
         self.p = self.m.Panel()
 
@@ -150,9 +153,10 @@ class OverrideTests(Fixture):
 
 
 class CreditTests(Fixture):
-    def model(self, vcpus):
-        conf = dict(self.m.PANEL_DEFAULTS, PANEL_CREDIT_VCPUS=str(vcpus))
-        return self.m.CreditModel(conf, vcpus, os.path.join(self.tmp, "credits.json"))
+    def model(self, vcpus, **keys):
+        conf = dict(self.m.PANEL_DEFAULTS, PANEL_CREDIT_PROVIDER="hostinger", **keys)
+        resolved = self.m.resolve_credit_conf(conf, vcpus)
+        return self.m.CreditModel(resolved["params"], os.path.join(self.tmp, "credits.json"))
 
     def test_hostinger_documented_numbers(self):
         k1, k8 = self.model(1), self.model(8)
@@ -331,6 +335,95 @@ class SwapTests(Fixture):
         for v in (-1, 201, "x"):
             with self.assertRaises(ValueError):
                 self.p.set_swappiness({"value": v})
+
+
+class ProviderTests(Fixture):
+    def resolve(self, nproc=8, **keys):
+        return self.m.resolve_credit_conf(dict(self.m.PANEL_DEFAULTS, **keys), nproc)
+
+    def test_default_is_disabled(self):
+        r = self.resolve()
+        self.assertEqual((r["provider"], r["enabled"], r["error"]), ("none", False, None))
+
+    def test_hostinger_preset(self):
+        p = self.resolve(PANEL_CREDIT_PROVIDER="hostinger")["params"]
+        self.assertEqual((p["vcpus"], p["baseline_pct"], p["throttle_pct"], p["cap_mode"], p["cap_hours"],
+                          p["recover_pct"], p["earn_while_throttled"]), (8, 60, 30, "burst", 3, 20, False))
+        self.assertEqual(self.resolve(1, PANEL_CREDIT_PROVIDER="hostinger")["params"]["throttle_pct"], 40)
+
+    def test_aws_t3_requires_baseline_and_throttles_to_it(self):
+        r = self.resolve(2, PANEL_CREDIT_PROVIDER="aws-t3")
+        self.assertFalse(r["enabled"])
+        self.assertIn("PANEL_CREDIT_BASELINE_PCT", r["error"])
+        r = self.resolve(2, PANEL_CREDIT_PROVIDER="aws-t3", PANEL_CREDIT_BASELINE_PCT="20")
+        p = r["params"]
+        self.assertEqual((p["throttle_pct"], p["cap_mode"], p["cap_hours"], p["recover_pct"]), (20, "accrual", 24, 0))
+        c = self.m.CreditModel(p, os.path.join(self.tmp, "c.json"), r["label"])
+        self.assertAlmostEqual(c.cap, 576 * 60)
+        c.balance, c.throttled = 0, True
+        c.step(c.limit * 0.95 * 60, 60)
+        self.assertGreater(c.balance, 0)
+        self.assertFalse(c.throttled)
+
+    def test_explicit_keys_override_preset(self):
+        p = self.resolve(PANEL_CREDIT_PROVIDER="hostinger", PANEL_CREDIT_BASELINE_PCT="50",
+                         PANEL_CREDIT_CAP_HOURS="2.5", PANEL_CREDIT_THROTTLE_PCT="45",
+                         PANEL_CREDIT_EARN_WHILE_THROTTLED="1")["params"]
+        self.assertEqual((p["baseline_pct"], p["cap_hours"], p["throttle_pct"], p["recover_pct"],
+                          p["earn_while_throttled"]), (50, 2.5, 45, 20, True))
+        p = self.resolve(PANEL_CREDIT_PROVIDER="aws-t3", PANEL_CREDIT_BASELINE_PCT="40",
+                         PANEL_CREDIT_CAP_MODE="burst")["params"]
+        self.assertEqual(p["cap_mode"], "burst")
+
+    def test_legacy_model_flag_and_burst_hours(self):
+        r = self.resolve(PANEL_CREDIT_MODEL="1", PANEL_CREDIT_BASELINE_PCT="50",
+                         PANEL_CREDIT_BURST_HOURS="2.5", PANEL_CREDIT_THROTTLE_PCT="45")
+        self.assertEqual((r["provider"], r["enabled"]), ("hostinger", True))
+        self.assertEqual((r["params"]["cap_hours"], r["params"]["cap_mode"]), (2.5, "burst"))
+        self.assertEqual(self.resolve(PANEL_CREDIT_MODEL="0")["provider"], "none")
+        self.assertEqual(self.resolve(PANEL_CREDIT_MODEL="1", PANEL_CREDIT_PROVIDER="none")["provider"], "none")
+
+    def test_custom_needs_explicit_values(self):
+        r = self.resolve(PANEL_CREDIT_PROVIDER="custom", PANEL_CREDIT_BASELINE_PCT="25")
+        self.assertFalse(r["enabled"])
+        r = self.resolve(PANEL_CREDIT_PROVIDER="custom", PANEL_CREDIT_BASELINE_PCT="25",
+                         PANEL_CREDIT_THROTTLE_PCT="10", PANEL_CREDIT_CAP_HOURS="12", PANEL_CREDIT_CAP_MODE="accrual")
+        self.assertTrue(r["enabled"])
+        self.assertEqual(r["params"]["cap_mode"], "accrual")
+
+    def test_invalid_values_disable_with_error(self):
+        for keys in ({"PANEL_CREDIT_PROVIDER": "acme"},
+                     {"PANEL_CREDIT_PROVIDER": "hostinger", "PANEL_CREDIT_BASELINE_PCT": "x"},
+                     {"PANEL_CREDIT_PROVIDER": "hostinger", "PANEL_CREDIT_CAP_MODE": "weird"}):
+            r = self.resolve(**keys)
+            self.assertFalse(r["enabled"])
+            self.assertTrue(r["error"])
+
+
+class NoProviderTests(Fixture):
+    PANEL_EXTRA = ""
+
+    def test_status_hides_credits(self):
+        st = self.p.status()
+        self.assertFalse(st["credits_enabled"])
+        self.assertIsNone(st["credits"])
+        self.assertEqual(st["credit_provider"]["provider"], "none")
+        self.assertEqual(self.p.credit_history(3600), [])
+
+    def test_governor_refused_and_loop_idle(self):
+        with self.assertRaises(ValueError):
+            self.p.save_config({"changes": {"CREDIT_GOVERNOR": "1"}})
+        with open(self.conf, "a") as f:
+            f.write("CREDIT_GOVERNOR=1\n")
+        quotas = []
+        self.p.set_quota = lambda pct, quiet=False: quotas.append(pct)
+        with self.p.sampler.lock:
+            for i in range(20):
+                self.p.sampler.history.append({"t": i, "busy": 90.0, "agents": 300.0})
+        self.p.governor_tick()
+        self.assertEqual(quotas, [])
+        self.assertFalse(self.p.gov["enabled"])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "credit-governor")))
 
 
 class GovernorTests(Fixture):

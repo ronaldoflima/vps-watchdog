@@ -385,8 +385,8 @@ library, no dependencies) for watching and steering everything above from a
 browser:
 
 - **Overview:** host CPU busy/steal, load, agent slice usage against its quota,
-  agent stall time (cgroup PSI), memory and swap, plus an **estimated
-  CPU-credit balance** (see below). Charts cover 1 h to 7 days: the last hour
+  agent stall time (cgroup PSI), memory and swap, plus, when a provider is
+  configured, an **estimated CPU-credit balance** (see below). Charts cover 1 h to 7 days: the last hour
   from 3 s samples, longer ranges from per-minute averages persisted in
   `STATE_DIR/panel-history.json` (`PANEL_HISTORY_DAYS`); on first start CPU and
   steal history are seeded from `atop` logs.
@@ -410,20 +410,67 @@ panel restarts. A key changed again in the meantime is left alone. Active
 overrides are listed at the top of every page with *+10 min*, *Revert now* and
 *Keep permanently*.
 
-### Estimated CPU credits
+### Burstable CPU credits
 
-Burstable VPS plans throttle the whole VM when it uses more than a baseline
-for too long. Hostinger documents its model as a token bucket: one credit is
-one vCPU-second at 100%; the VM earns 60% of its vCPUs per second and spends
-what it actually runs; a full balance lasts about 3 h at 100% on every vCPU;
-at zero the VM is capped at 30% (40% on KVM 1) and earns nothing until it is
-back to 20%. The provider does not expose the balance, so the panel estimates
-it from the guest's own non-idle CPU time (`/proc/stat`, steal excluded): on
-first start it replays the last 7 days of `atop` logs, then tracks live and
-persists the estimate in `STATE_DIR/panel-credits.json`. The overview shows
-the balance, whether it is draining or refilling and how long all vCPUs can
-run flat out. Tune `PANEL_CREDIT_*` in `/etc/cpu-watchdog-panel.conf` for
-other plans or providers, or set `PANEL_CREDIT_MODEL=0`.
+Burstable VPS and cloud plans throttle the whole VM when it uses more than a
+baseline for too long. Most model this as a token bucket: the VM earns credits
+at its baseline rate, spends the CPU time it actually runs, and is capped when
+the balance hits zero. The provider measures this on the host and usually does
+not expose the balance to the guest, so the panel **estimates** it from the
+guest's own non-idle CPU time (`/proc/stat` user+nice+system+irq+softirq,
+steal excluded). On first start it replays the last `PANEL_CREDIT_REPLAY_HOURS`
+of `atop` logs from a full balance, then tracks live and persists the estimate
+in `STATE_DIR/panel-credits.json`. The overview then shows the balance, whether
+it is draining or refilling and how long all vCPUs can run flat out.
+
+Credits are **off by default** (`PANEL_CREDIT_PROVIDER=none`): the credits tile,
+chart and governor action are hidden. Pick a preset in
+`/etc/cpu-watchdog-panel.conf` and restart the panel:
+
+| `PANEL_CREDIT_PROVIDER` | Baseline | Capacity | At zero | Limit lifts |
+|---|---|---|---|---|
+| `none` (default) | – | – | – | – |
+| `hostinger` (KVM plans) | 60% of the vCPUs | `burst`, 3 h at 100% on every vCPU: 3 h × (vCPUs − baseline cores) | capped at 30% (40% on 1 vCPU), nothing earned while pressing the cap | at 20% of capacity |
+| `aws-t3` (T3/T3a standard mode) | **required**: `PANEL_CREDIT_BASELINE_PCT` per instance size | `accrual`, 24 h of baseline earnings | capped at the baseline | as soon as any credit accrues |
+| `custom` | `PANEL_CREDIT_BASELINE_PCT` | `PANEL_CREDIT_CAP_MODE` / `PANEL_CREDIT_CAP_HOURS` | `PANEL_CREDIT_THROTTLE_PCT` | `PANEL_CREDIT_RECOVER_PCT` (default 0) |
+
+AWS T3 baseline per vCPU: `t3.nano` 5, `t3.micro` 10, `t3.small` 20,
+`t3.medium` 20, `t3.large` 30, `t3.xlarge` 40, `t3.2xlarge` 40 (same for
+T3a). T3 instances launch in *unlimited* mode by default, where AWS bills the
+surplus instead of throttling; the preset only makes sense in standard mode.
+
+Every explicit key overrides the preset:
+
+| Key | Meaning |
+|---|---|
+| `PANEL_CREDIT_VCPUS` | vCPUs the provider bills for (default: `nproc`) |
+| `PANEL_CREDIT_BASELINE_PCT` | earn rate, % of all vCPUs |
+| `PANEL_CREDIT_CAP_MODE` | `burst`: capacity = hours × (vCPUs − baseline cores); `accrual`: capacity = hours × baseline cores |
+| `PANEL_CREDIT_CAP_HOURS` | hours for the capacity formula |
+| `PANEL_CREDIT_THROTTLE_PCT` | CPU cap at zero balance, % of all vCPUs |
+| `PANEL_CREDIT_RECOVER_PCT` | the cap lifts when the balance is back to this % of capacity |
+| `PANEL_CREDIT_EARN_WHILE_THROTTLED` | `0` = nothing is earned while usage presses the cap (≥ 90% of it) |
+
+Older configs keep working: `PANEL_CREDIT_MODEL=1` without a provider means
+`hostinger`, and `PANEL_CREDIT_BURST_HOURS` is read as `PANEL_CREDIT_CAP_HOURS`
+with `burst` mode. An incomplete or invalid configuration disables the estimate
+and the overview says why.
+
+**Calibrating.** The numbers are estimates: the provider meters the host side
+(including hypervisor overhead the guest does not see) and plans drift from
+the documentation. When the provider confirms a throttling event (support
+ticket, console graph, or a sudden flat ceiling in the CPU chart with steal
+rising), fit the model to it:
+
+1. Note when the cap started and the cap level (e.g. busy flat at 50% of the
+   vCPUs); set `PANEL_CREDIT_THROTTLE_PCT` to that level.
+2. Make sure `PANEL_CREDIT_REPLAY_HOURS` covers the event plus a quiet period
+   before it (the replay assumes a full balance at its start).
+3. Adjust `PANEL_CREDIT_BASELINE_PCT` and `PANEL_CREDIT_CAP_HOURS`, delete
+   `STATE_DIR/panel-credits.json` and restart the panel to replay history.
+4. Repeat until the replayed balance reaches zero at the time the cap started
+   (and the limit lifts when the provider lifted it). A lower baseline drains
+   faster during long busy stretches; a smaller capacity shortens short bursts.
 
 ### Credit governor
 
@@ -440,7 +487,9 @@ to the panel. The effect is to use the whole VM while credits last and to
 slow down gradually as they run out, approaching the baseline instead of
 hitting the provider's cap. If the panel stops, the file goes stale and the
 watchdog restores the fixed policy within 3 minutes. Manual quota changes
-are refused while the governor is on.
+are refused while the governor is on. The governor needs a credit provider:
+with `PANEL_CREDIT_PROVIDER=none` the panel refuses to turn it on and the loop
+does nothing.
 
 The panel runs as root, so it listens on `127.0.0.1:8790` only and every API
 call needs the bearer token from `/etc/cpu-watchdog-panel.token` (created on
