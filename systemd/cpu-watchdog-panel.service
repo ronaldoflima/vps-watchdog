@@ -1,0 +1,16 @@
+[Unit]
+Description=cpu-watchdog web panel (loopback only, token protected)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/cpu-watchdog-panel/cpu-watchdog-panel.py
+Environment=CPU_WATCHDOG_PANEL_STATIC=/usr/local/lib/cpu-watchdog-panel/static
+Restart=on-failure
+RestartSec=3
+# Stay responsive while the host is saturated: that is when the panel is needed.
+Nice=-5
+CPUWeight=500
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
