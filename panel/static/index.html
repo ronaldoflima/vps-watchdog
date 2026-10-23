@@ -178,6 +178,21 @@
         </div>
         <p class="muted small" id="cfg-path"></p>
       </div>
+      <div class="card" id="credits-cfg">
+        <h3>CPU credits</h3>
+        <p class="muted small">Estimate of a burstable-CPU provider&#39;s credit balance (shown on the Overview, used by the credit governor). Empty fields use the provider preset. Saving replays the atop history with the new settings. Stored in <code id="cc-path"></code>.</p>
+        <div class="row">
+          <label for="cc-provider">Provider</label>
+          <select id="cc-provider"></select>
+          <span id="cc-state" class="muted small"></span>
+        </div>
+        <div id="cc-fields"></div>
+        <div class="row">
+          <span id="cc-error" class="error small"></span>
+          <span class="spacer"></span>
+          <button id="cc-save" class="primary">Save credits</button>
+        </div>
+      </div>
       <div id="cfg-groups"></div>
       <div class="card">
         <h3>earlyoom</h3>

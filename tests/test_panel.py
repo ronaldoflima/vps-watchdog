@@ -425,6 +425,36 @@ class NoProviderTests(Fixture):
         self.assertFalse(self.p.gov["enabled"])
         self.assertFalse(os.path.exists(os.path.join(self.state, "credit-governor")))
 
+    def test_save_credit_config_enables_and_persists(self):
+        with self.assertRaises(ValueError):
+            self.p.save_credit_config({"values": {"PANEL_CREDIT_PROVIDER": "custom"}})
+        with self.assertRaises(ValueError):
+            self.p.save_credit_config({"values": {"PANEL_CREDIT_PROVIDER": "hostinger",
+                                                  "PANEL_CREDIT_BASELINE_PCT": "5$(x)"}})
+        self.assertIsNone(self.p.sampler.credits)
+        with open(self.panel_conf, "a") as f:
+            f.write("PANEL_CREDIT_BURST_HOURS=9\n")
+        self.p.save_credit_config({"values": {"PANEL_CREDIT_PROVIDER": "hostinger", "PANEL_CREDIT_BASELINE_PCT": "50",
+                                              "PANEL_CREDIT_CAP_HOURS": "2.5"}})
+        self.assertIsNotNone(self.p.sampler.credits)
+        self.assertTrue(self.p.status()["credits_enabled"])
+        text = open(self.panel_conf).read()
+        self.assertIn("PANEL_CREDIT_PROVIDER=hostinger", text)
+        self.assertIn("PANEL_CREDIT_CAP_HOURS=2.5", text)
+        self.assertNotIn("BURST_HOURS", text)
+        cfg = self.p.credit_config()
+        self.assertEqual(cfg["values"]["PANEL_CREDIT_BASELINE_PCT"], "50")
+        self.assertEqual(cfg["presets"]["hostinger"]["throttle_pct"], "30 (40 on 1 vCPU)")
+
+    def test_disabling_credits_refused_while_governor_on(self):
+        self.p.save_credit_config({"values": {"PANEL_CREDIT_PROVIDER": "hostinger"}})
+        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "1"}})
+        with self.assertRaises(ValueError):
+            self.p.save_credit_config({"values": {"PANEL_CREDIT_PROVIDER": ""}})
+        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "0"}})
+        self.p.save_credit_config({"values": {"PANEL_CREDIT_PROVIDER": ""}})
+        self.assertIsNone(self.p.sampler.credits)
+
 
 class GovernorTests(Fixture):
     def setUp(self):

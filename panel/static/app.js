@@ -545,11 +545,67 @@ $(".quick").addEventListener("click", (e) => {
 
 async function loadConfig() {
   try {
-    config = await api("/api/config");
+    [config, creditCfg] = await Promise.all([api("/api/config"), api("/api/credits/config")]);
     cfgEdits = {};
     renderConfig();
+    renderCreditConfig();
   } catch { /* toast already shown */ }
 }
+
+let creditCfg = null;
+const CREDIT_FIELDS = [
+  ["PANEL_CREDIT_VCPUS", "vCPUs", "vcpus", "Billed vCPUs (empty = this host's CPU count)."],
+  ["PANEL_CREDIT_BASELINE_PCT", "Baseline %", "baseline_pct", "Sustained usage that earns as much as it spends, % of all vCPUs."],
+  ["PANEL_CREDIT_CAP_MODE", "Capacity mode", "cap_mode", "burst: a full balance lasts N hours at 100%; accrual: it holds N hours of baseline earnings."],
+  ["PANEL_CREDIT_CAP_HOURS", "Capacity hours", "cap_hours", "The N in the capacity mode."],
+  ["PANEL_CREDIT_THROTTLE_PCT", "Throttle %", "throttle_pct", "CPU cap applied by the provider when the balance hits zero, % of all vCPUs."],
+  ["PANEL_CREDIT_RECOVER_PCT", "Recover %", "recover_pct", "Balance (%) at which the provider lifts the cap."],
+  ["PANEL_CREDIT_EARN_WHILE_THROTTLED", "Earn while capped", "earn_while_throttled", "0: no credits are earned while usage sits at the cap."],
+];
+
+function renderCreditConfig() {
+  const c = creditCfg;
+  const vals = { ...c.values };
+  if (!vals.PANEL_CREDIT_PROVIDER && c.legacy.PANEL_CREDIT_MODEL === "1") vals.PANEL_CREDIT_PROVIDER = "hostinger";
+  if (!vals.PANEL_CREDIT_CAP_HOURS && c.legacy.PANEL_CREDIT_BURST_HOURS) vals.PANEL_CREDIT_CAP_HOURS = c.legacy.PANEL_CREDIT_BURST_HOURS;
+  const provider = vals.PANEL_CREDIT_PROVIDER || "none";
+  $("#cc-path").textContent = c.path;
+  $("#cc-provider").innerHTML = c.providers.map((p) => `<option value="${esc(p)}"${p === provider ? " selected" : ""}>${esc(p === "none" ? "None (disabled)" : c.labels[p])}</option>`).join("");
+  const r = c.resolved;
+  $("#cc-state").textContent = r.enabled ? `active · ${r.label}` : r.error ? "" : "disabled";
+  $("#cc-error").textContent = r.error || "";
+  renderCreditFields(vals);
+}
+
+function renderCreditFields(vals) {
+  const provider = $("#cc-provider").value;
+  const preset = creditCfg.presets[provider];
+  $("#cc-fields").hidden = !preset;
+  if (!preset) return;
+  $("#cc-fields").innerHTML = CREDIT_FIELDS.map(([key, label, pk, doc]) => {
+    const v = vals[key] || "";
+    const ph = key === "PANEL_CREDIT_VCPUS" ? String(creditCfg.nproc) : preset[pk] ?? "";
+    const input = key === "PANEL_CREDIT_CAP_MODE" || key === "PANEL_CREDIT_EARN_WHILE_THROTTLED"
+      ? `<select data-cc="${key}"><option value="">preset (${esc(ph)})</option>${(key === "PANEL_CREDIT_CAP_MODE" ? ["burst", "accrual"] : ["0", "1"]).map((o) => `<option${o === v ? " selected" : ""}>${o}</option>`).join("")}</select>`
+      : `<input data-cc="${key}" class="narrow" value="${esc(v)}" placeholder="${esc(ph)}" inputmode="decimal">`;
+    return `<div class="row"><label title="${esc(key)}">${esc(label)}</label>${input}<span class="muted small grow">${esc(doc)}</span></div>`;
+  }).join("");
+}
+
+function creditFormValues() {
+  const values = { PANEL_CREDIT_PROVIDER: $("#cc-provider").value === "none" ? "" : $("#cc-provider").value };
+  for (const el of $$("[data-cc]")) values[el.dataset.cc] = el.value.trim();
+  return values;
+}
+
+$("#cc-provider").addEventListener("change", () => {
+  const keep = creditFormValues();
+  renderCreditFields($("#cc-provider").value === creditCfg.values.PANEL_CREDIT_PROVIDER ? keep : {});
+});
+$("#cc-save").addEventListener("click", async () => {
+  const r = await act("/api/credits/config", { values: creditFormValues() }, "Save the CPU-credit settings and replay the history?");
+  if (r) { await loadConfig(); refresh(); setTimeout(refreshHistory, 3000); }
+});
 
 function cfgInput(e) {
   const id = `cfg-${e.key}`;

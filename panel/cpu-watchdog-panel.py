@@ -405,6 +405,13 @@ CREDIT_PROVIDERS = {
 CREDIT_PROVIDER_NAMES = ("none",) + tuple(CREDIT_PROVIDERS)
 
 
+CREDIT_KEYS = ("PANEL_CREDIT_PROVIDER", "PANEL_CREDIT_VCPUS", "PANEL_CREDIT_BASELINE_PCT",
+               "PANEL_CREDIT_THROTTLE_PCT", "PANEL_CREDIT_CAP_MODE", "PANEL_CREDIT_CAP_HOURS",
+               "PANEL_CREDIT_RECOVER_PCT", "PANEL_CREDIT_EARN_WHILE_THROTTLED")
+CREDIT_LEGACY_KEYS = ("PANEL_CREDIT_MODEL", "PANEL_CREDIT_BURST_HOURS")
+CREDIT_VALUE_RE = re.compile(r"^[A-Za-z0-9._-]{0,32}$")
+
+
 def resolve_credit_conf(conf, nproc):
     """Provider preset merged with explicit PANEL_CREDIT_* keys.
 
@@ -770,21 +777,33 @@ class Sampler(threading.Thread):
         self.minutes = MinuteHistory(os.path.join(panel.state_dir(), "panel-history.json"), days)
         need_history = not self.minutes.load()
         self.credits = None
-        need_credits = False
-        self.credit_conf = resolve_credit_conf(panel.conf, self.nproc)
-        if self.credit_conf["error"]:
-            sys.stderr.write("credits disabled: %s\n" % self.credit_conf["error"])
-        if self.credit_conf["enabled"]:
-            params = dict(self.credit_conf["params"], history_days=panel.conf["PANEL_HISTORY_DAYS"])
-            self.credits = CreditModel(params, os.path.join(panel.state_dir(), "panel-credits.json"),
-                                       self.credit_conf["label"])
-            need_credits = not self.credits.load()
-            self.credits.backfilling = need_credits
+        need_credits = self.setup_credits()
         if need_history or need_credits:
             threading.Thread(target=self.backfill, args=(need_history, need_credits), daemon=True).start()
 
+    def setup_credits(self, fresh=False):
+        """(Re)build the credit model from the panel conf; True when it must be replayed."""
+        conf = resolve_credit_conf(self.panel.conf, self.nproc)
+        if conf["error"]:
+            sys.stderr.write("credits disabled: %s\n" % conf["error"])
+        credits, need = None, False
+        if conf["enabled"]:
+            path = os.path.join(self.panel.state_dir(), "panel-credits.json")
+            if fresh:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            params = dict(conf["params"], history_days=self.panel.conf["PANEL_HISTORY_DAYS"])
+            credits = CreditModel(params, path, conf["label"])
+            need = not credits.load()
+            credits.backfilling = need
+        self.credit_conf, self.credits = conf, credits
+        return need
+
     def backfill(self, need_history, need_credits):
         """One pass over the atop logs seeds the minute history and replays the credits."""
+        credits = self.credits
         replay = int(self.panel.conf["PANEL_CREDIT_REPLAY_HOURS"])
         hours = max(replay if need_credits else 0, int(self.panel.conf["PANEL_HISTORY_DAYS"]) * 24 if need_history else 0)
         samples = atop_samples(self.panel.conf["PANEL_ATOP_DIR"], hours)
@@ -792,16 +811,16 @@ class Sampler(threading.Thread):
             n = float(self.nproc)
             self.minutes.seed([{"t": int(t), "busy": round(c / n * 100, 1), "steal": round(st / n * 100, 1)}
                                for t, _dt, c, st in samples])
-        if need_credits:
+        if need_credits and credits is not None:
             since = time.time() - replay * 3600
             replayed = [x for x in samples if x[0] >= since]
             if replayed:
                 span = (replayed[-1][0] - replayed[0][0]) / 3600
-                self.credits.backfill(replayed, "replayed %.0f h of atop history, then live" % span)
+                credits.backfill(replayed, "replayed %.0f h of atop history, then live" % span)
             else:
-                with self.credits.lock:
-                    self.credits.backfilling = False
-                    self.credits.pending = []
+                with credits.lock:
+                    credits.backfilling = False
+                    credits.pending = []
 
     def _boot_time(self):
         for line in read_file(os.path.join(PROC, "stat")).splitlines():
@@ -1530,6 +1549,57 @@ class Panel:
         self.audit("earlyoom args=%s" % args)
         return {"ok": True, "message": "earlyoom restarted with the new arguments."}
 
+    def credit_config(self):
+        def show(v):
+            if v is None:
+                return "required"
+            if v == "baseline":
+                return "= baseline"
+            if callable(v):
+                return "%s (%s on 1 vCPU)" % (v(2), v(1))
+            if isinstance(v, bool):
+                return "1" if v else "0"
+            return str(v)
+        presets = {name: {k: show(v) for k, v in p.items() if k != "label"} for name, p in CREDIT_PROVIDERS.items()}
+        labels = {name: p["label"] for name, p in CREDIT_PROVIDERS.items()}
+        return {"path": PANEL_CONF, "nproc": self.sampler.nproc,
+                "values": {k: self.conf.get(k, "") for k in CREDIT_KEYS},
+                "legacy": {k: self.conf.get(k, "") for k in CREDIT_LEGACY_KEYS if self.conf.get(k)},
+                "providers": list(CREDIT_PROVIDER_NAMES), "labels": labels, "presets": presets,
+                "resolved": self.sampler.credit_conf}
+
+    def save_credit_config(self, body):
+        values = body.get("values")
+        if not isinstance(values, dict):
+            raise ValueError("expected values")
+        changes = {}
+        for key in CREDIT_KEYS:
+            v = str(values.get(key) or "").strip()
+            if not CREDIT_VALUE_RE.match(v):
+                raise ValueError("%s: invalid value %r" % (key, v))
+            changes[key] = v
+        trial = dict(self.conf)
+        trial.update(changes)
+        for key in CREDIT_LEGACY_KEYS:
+            trial[key] = ""
+        resolved = resolve_credit_conf(trial, self.sampler.nproc)
+        if resolved["error"]:
+            raise ValueError(resolved["error"])
+        if not resolved["enabled"] and self.watchdog_value("CREDIT_GOVERNOR") == "1":
+            raise ValueError("Turn the credit governor off before disabling CPU credits.")
+        rendered = {k: (v or None) for k, v in changes.items()}
+        rendered.update({k: None for k in CREDIT_LEGACY_KEYS})
+        backup(PANEL_CONF)
+        atomic_write(PANEL_CONF, set_assignments(read_file(PANEL_CONF, ""), rendered), 0o600)
+        self.conf.update(trial)
+        if self.sampler.setup_credits(fresh=True):
+            threading.Thread(target=self.sampler.backfill, args=(False, True), daemon=True).start()
+        self.audit("panel credits %s" % " ".join("%s=%s" % (k[len("PANEL_CREDIT_"):], v)
+                                                  for k, v in changes.items() if v))
+        if not resolved["enabled"]:
+            return {"ok": True, "message": "CPU credits disabled."}
+        return {"ok": True, "message": "CPU credits (%s) saved; replaying history." % resolved["label"]}
+
     def save_units(self, body):
         units = " ".join(body.get("units", "").split())
         if any(not UNIT_RE.match(u) for u in units.split()):
@@ -1909,6 +1979,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, self.panel.history(seconds))
             if url.path == "/api/config":
                 return self.send(200, self.panel.config())
+            if url.path == "/api/credits/config":
+                return self.send(200, self.panel.credit_config())
             if url.path == "/api/tmux":
                 return self.send(200, {"sessions": self.panel.tmux_targets()})
             if url.path == "/api/log":
@@ -1935,6 +2007,7 @@ class Handler(BaseHTTPRequestHandler):
         routes = {
             "/api/config": self.panel.save_config,
             "/api/config/restore": lambda _b: self.panel.restore_config(),
+            "/api/credits/config": self.panel.save_credit_config,
             "/api/earlyoom": self.panel.save_earlyoom,
             "/api/units": self.panel.save_units,
             "/api/action": self.panel.action,
