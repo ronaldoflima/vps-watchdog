@@ -213,6 +213,26 @@ def systemctl_cmd(spec):
     return ["systemctl"], spec
 
 
+def systemctl_show_many(specs, props):
+    """One systemctl call per manager instead of one per unit."""
+    groups = collections.OrderedDict()
+    for spec in specs:
+        try:
+            base, unit = systemctl_cmd(spec)
+        except ValueError:
+            continue
+        groups.setdefault(tuple(base), []).append((spec, unit))
+    result = {}
+    for base, items in groups.items():
+        rc, out = run(list(base) + ["show"] + [u for _s, u in items] + ["-p", ",".join(props)], timeout=15)
+        if rc != 0:
+            continue
+        blocks = out.split("\n\n")
+        for (spec, _unit), block in zip(items, blocks):
+            result[spec] = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+    return result
+
+
 def systemctl_show(spec, props):
     try:
         base, unit = systemctl_cmd(spec)
@@ -346,6 +366,10 @@ class Sampler(threading.Thread):
         self.host = {}
         self.slow = {}
         self.slow_t = 0
+        self.last_view = 0
+        self.sample_lock = threading.Lock()
+        self.slice_path = None
+        self.slice_name = None
         maxlen = int(panel.conf["PANEL_HISTORY_MIN"]) * 60 // max(1, int(panel.conf["PANEL_SAMPLE_SEC"]))
         self.history = collections.deque(maxlen=max(10, maxlen))
         self.hz = os.sysconf("SC_CLK_TCK")
@@ -398,8 +422,20 @@ class Sampler(threading.Thread):
             }
         return procs
 
+    def viewed(self):
+        self.last_view = time.time()
+
+    def viewing(self):
+        return time.time() - self.last_view < 30
+
     def slice_dir(self):
         name = self.panel.watchdog_value("AGENT_SLICE")
+        if name == self.slice_name and self.slice_path and os.path.isdir(self.slice_path):
+            return self.slice_path
+        self.slice_name, self.slice_path = name, self.find_slice(name)
+        return self.slice_path
+
+    def find_slice(self, name):
         for root, dirs, _files in os.walk(CGROUP):
             if os.path.basename(root) == name:
                 return root
@@ -432,9 +468,14 @@ class Sampler(threading.Thread):
         }
 
     def sample(self):
+        with self.sample_lock:
+            self._sample()
+
+    def _sample(self):
         t = time.time()
         cpu = self.read_cpu()
-        procs = self.read_procs()
+        viewing = self.viewing()
+        procs = self.read_procs() if viewing else {}
         sl = self.read_slice()
         host = {"t": t, "nproc": self.nproc}
         if cpu and self.prev_cpu:
@@ -471,7 +512,7 @@ class Sampler(threading.Thread):
                     p["cpu"] = None
                 rows.append((pid, p))
 
-        if t - self.slow_t > 10:
+        if viewing and t - self.slow_t > 10:
             slow = self.panel.collect_slow()
             with self.lock:
                 self.slow = slow
@@ -607,9 +648,7 @@ class Panel:
     def collect_slow(self):
         props = ["ActiveState", "SubState", "MainPID", "MemoryCurrent", "CPUUsageNSec",
                  "ActiveEnterTimestamp", "Description", "LoadState", "UnitFileState"]
-        units = {}
-        for u in self.units():
-            units[u] = systemctl_show(u, props)
+        units = systemctl_show_many(self.units(), props)
         timer = systemctl_show("cpu-watchdog.timer", ["ActiveState", "LastTriggerUSec", "NextElapseUSecRealtime"])
         service = systemctl_show("cpu-watchdog.service", ["Result", "ExecMainStatus", "ExecMainExitTimestamp"])
         earlyoom = systemctl_show("earlyoom.service", ["ActiveState", "SubState"])
@@ -641,6 +680,10 @@ class Panel:
         }
 
     def status(self):
+        if not self.sampler.viewing():
+            self.sampler.viewed()
+            self.sampler.sample()
+        self.sampler.viewed()
         host, sl, rows, slow = self.sampler.snapshot()
         vals = self.watchdog_values()
 
