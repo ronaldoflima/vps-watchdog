@@ -53,7 +53,8 @@ PANEL_DEFAULTS = {
     "PANEL_CREDIT_BURST_HOURS": "3",
     "PANEL_CREDIT_RECOVER_PCT": "20",
     "PANEL_ATOP_DIR": "/var/log/atop",
-    "PANEL_CREDIT_REPLAY_HOURS": "72",
+    "PANEL_CREDIT_REPLAY_HOURS": "168",
+    "PANEL_HISTORY_DAYS": "7",
     "WATCHDOG_CONF": "/etc/cpu-watchdog.conf",
     "WATCHDOG_CTL": "/usr/local/bin/cpu-watchdog-ctl",
     "EARLYOOM_DEFAULT": "/etc/default/earlyoom",
@@ -401,7 +402,7 @@ class CreditModel:
         self.throttled = False
         self.source = "assumed full (no history yet)"
         self.last = None
-        self.history = collections.deque(maxlen=24 * 60)
+        self.history = collections.deque(maxlen=int(conf.get("PANEL_HISTORY_DAYS") or 7) * 24 * 60)
         self.recent = collections.deque(maxlen=200)
         self.pending = []
         self.backfilling = False
@@ -463,7 +464,7 @@ class CreditModel:
         with self.lock:
             self.balance, self.throttled = self.cap, False
             hist = []
-            for t, dt, cores in samples:
+            for t, dt, cores, *_ in samples:
                 self.step(cores * dt, dt)
                 hist.append((int(t), round(self.balance / self.cap * 100, 2)))
             for consumed, dt in self.pending:
@@ -473,7 +474,7 @@ class CreditModel:
             self.source = source
             live = list(self.history)
             self.history.clear()
-            self.history.extend(hist[-(24 * 6):] + [h for h in live if not hist or h[0] > hist[-1][0]])
+            self.history.extend(hist + [h for h in live if not hist or h[0] > hist[-1][0]])
         self.save()
 
     def summary(self):
@@ -506,8 +507,103 @@ class CreditModel:
         return out
 
 
+def downsample(points, since, bins=600):
+    """Average dict points (with "t") newer than SINCE into at most BINS buckets."""
+    points = [p for p in points if p["t"] >= since]
+    if len(points) <= bins:
+        return points
+    width = (points[-1]["t"] - since) / float(bins) or 1
+    out, cur, idx = [], None, None
+    for p in points:
+        b = int((p["t"] - since) // width)
+        if b != idx:
+            if cur:
+                out.append(cur.finish())
+            cur, idx = _Bucket(), b
+        cur.add(p)
+    if cur:
+        out.append(cur.finish())
+    return out
+
+
+class _Bucket:
+    def __init__(self):
+        self.sums, self.counts, self.last = {}, {}, None
+
+    def add(self, p):
+        self.last = p
+        for k, v in p.items():
+            if k != "t" and isinstance(v, (int, float)):
+                self.sums[k] = self.sums.get(k, 0.0) + v
+                self.counts[k] = self.counts.get(k, 0) + 1
+
+    def finish(self):
+        out = {"t": self.last["t"]}
+        for k in self.sums:
+            out[k] = round(self.sums[k] / self.counts[k], 2)
+        return out
+
+
+class MinuteHistory:
+    """Per-minute averages of the live samples, kept for PANEL_HISTORY_DAYS and persisted."""
+
+    def __init__(self, path, days):
+        self.path = path
+        self.lock = threading.Lock()
+        self.points = collections.deque(maxlen=max(1, days) * 24 * 60)
+        self.minute = None
+        self.acc = _Bucket()
+        self.last_saved = time.time()
+
+    def add(self, rec):
+        m = int(rec["t"]) // 60
+        with self.lock:
+            if self.minute is not None and m != self.minute and self.acc.last:
+                point = self.acc.finish()
+                point["t"] = self.minute * 60
+                self.points.append(point)
+                self.acc = _Bucket()
+            self.minute = m
+            self.acc.add(rec)
+        if time.time() - self.last_saved >= 300:
+            self.save()
+
+    def load(self):
+        try:
+            data = json.loads(read_file(self.path, ""))
+        except ValueError:
+            return False
+        if not isinstance(data, list):
+            return False
+        with self.lock:
+            self.points.extend(p for p in data if isinstance(p, dict) and "t" in p)
+        return True
+
+    def save(self):
+        self.last_saved = time.time()
+        with self.lock:
+            data = list(self.points)
+        try:
+            atomic_write(self.path, json.dumps(data, separators=(",", ":")), 0o600)
+        except OSError:
+            pass
+
+    def seed(self, points):
+        """Prepend older points (e.g. from atop) before the first live minute."""
+        with self.lock:
+            first = self.points[0]["t"] if self.points else float("inf")
+            merged = [p for p in points if p["t"] < first] + list(self.points)
+            self.points.clear()
+            self.points.extend(merged[-self.points.maxlen:])
+        self.save()
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.points)
+
+
 def atop_samples(atop_dir, hours, hz_cores=100.0):
-    """(epoch, interval seconds, busy cores) from atop raw logs of the last HOURS hours."""
+    """(epoch, interval seconds, busy cores, steal cores) from atop logs of the last HOURS hours."""
     since = time.time() - hours * 3600
     days = sorted({time.strftime("%Y%m%d", time.localtime(x))
                    for x in range(int(since), int(time.time()) + 86400, 86400)})
@@ -527,10 +623,11 @@ def atop_samples(atop_dir, hours, hz_cores=100.0):
                 if prev is not None and 0 < t - prev <= 3600 and t >= since:
                     try:
                         cores = sum(float(x) for x in f[2:7]) / hz_cores
+                        steal = float(f[7]) / hz_cores
                     except ValueError:
                         cores = None
                     if cores is not None:
-                        samples.append((t, t - prev, cores))
+                        samples.append((t, t - prev, cores, steal))
                 prev = t
             elif "restart" in line.lower():
                 prev = None
@@ -562,24 +659,38 @@ class Sampler(threading.Thread):
         self.hz = os.sysconf("SC_CLK_TCK")
         self.nproc = os.cpu_count() or 1
         self.boot = self._boot_time()
+        days = int(panel.conf["PANEL_HISTORY_DAYS"])
+        self.minutes = MinuteHistory(os.path.join(panel.state_dir(), "panel-history.json"), days)
+        need_history = not self.minutes.load()
         self.credits = None
+        need_credits = False
         if panel.conf["PANEL_CREDIT_MODEL"] == "1":
             self.credits = CreditModel(panel.conf, self.nproc,
                                        os.path.join(panel.state_dir(), "panel-credits.json"))
-            if not self.credits.load():
-                self.credits.backfilling = True
-                threading.Thread(target=self.backfill_credits, daemon=True).start()
+            need_credits = not self.credits.load()
+            self.credits.backfilling = need_credits
+        if need_history or need_credits:
+            threading.Thread(target=self.backfill, args=(need_history, need_credits), daemon=True).start()
 
-    def backfill_credits(self):
-        samples = atop_samples(self.panel.conf["PANEL_ATOP_DIR"],
-                               int(self.panel.conf["PANEL_CREDIT_REPLAY_HOURS"]))
-        if samples:
-            hours = (samples[-1][0] - samples[0][0]) / 3600
-            self.credits.backfill(samples, "replayed %.0f h of atop history, then live" % hours)
-        else:
-            with self.credits.lock:
-                self.credits.backfilling = False
-                self.credits.pending = []
+    def backfill(self, need_history, need_credits):
+        """One pass over the atop logs seeds the minute history and replays the credits."""
+        replay = int(self.panel.conf["PANEL_CREDIT_REPLAY_HOURS"])
+        hours = max(replay if need_credits else 0, int(self.panel.conf["PANEL_HISTORY_DAYS"]) * 24 if need_history else 0)
+        samples = atop_samples(self.panel.conf["PANEL_ATOP_DIR"], hours)
+        if need_history and samples:
+            n = float(self.nproc)
+            self.minutes.seed([{"t": int(t), "busy": round(c / n * 100, 1), "steal": round(st / n * 100, 1)}
+                               for t, _dt, c, st in samples])
+        if need_credits:
+            since = time.time() - replay * 3600
+            replayed = [x for x in samples if x[0] >= since]
+            if replayed:
+                span = (replayed[-1][0] - replayed[0][0]) / 3600
+                self.credits.backfill(replayed, "replayed %.0f h of atop history, then live" % span)
+            else:
+                with self.credits.lock:
+                    self.credits.backfilling = False
+                    self.credits.pending = []
 
     def _boot_time(self):
         for line in read_file(os.path.join(PROC, "stat")).splitlines():
@@ -743,6 +854,7 @@ class Sampler(threading.Thread):
                     "swap_used": host.get("swap_used_pct"),
                     "psi_cpu": host["psi"]["cpu"].get("some", {}).get("avg10"),
                 })
+                self.minutes.add(self.history[-1])
 
     def snapshot(self):
         with self.lock:
@@ -953,13 +1065,22 @@ class Panel:
         out["backfilling"] = c.backfilling
         return out
 
-    def credit_history(self):
+    def credit_history(self, seconds):
         c = self.sampler.credits
-        return c.summary()["history"] if c else []
+        if not c:
+            return []
+        points = [{"t": t, "credits": v} for t, v in c.summary()["history"]]
+        return downsample(points, time.time() - seconds)
 
-    def history(self):
+    def history(self, seconds):
+        since = time.time() - seconds
         with self.sampler.lock:
-            return list(self.sampler.history)
+            raw = list(self.sampler.history)
+        if raw and raw[0]["t"] <= since:
+            return downsample(raw, since)
+        first_raw = raw[0]["t"] if raw else float("inf")
+        older = [p for p in self.sampler.minutes.snapshot() if p["t"] < first_raw]
+        return downsample(older + raw, since)
 
     def config(self):
         vals = self.watchdog_values()
@@ -1528,12 +1649,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/api/status":
                 return self.send(200, self.panel.status())
-            if url.path == "/api/history":
-                return self.send(200, self.panel.history())
+            if url.path in ("/api/history", "/api/credits"):
+                try:
+                    seconds = int(parse_qs(url.query).get("range", ["3600"])[0])
+                except ValueError:
+                    seconds = 3600
+                seconds = max(300, min(seconds, 31 * 86400))
+                if url.path == "/api/credits":
+                    return self.send(200, self.panel.credit_history(seconds))
+                return self.send(200, self.panel.history(seconds))
             if url.path == "/api/config":
                 return self.send(200, self.panel.config())
-            if url.path == "/api/credits":
-                return self.send(200, self.panel.credit_history())
             if url.path == "/api/tmux":
                 return self.send(200, {"sessions": self.panel.tmux_targets()})
             if url.path == "/api/log":

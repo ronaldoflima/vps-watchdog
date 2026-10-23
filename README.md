@@ -385,8 +385,11 @@ library, no dependencies) for watching and steering everything above from a
 browser:
 
 - **Overview:** host CPU busy/steal, load, agent slice usage against its quota,
-  agent stall time (cgroup PSI), memory and swap, with one hour of history,
-  plus an **estimated CPU-credit balance** (see below).
+  agent stall time (cgroup PSI), memory and swap, plus an **estimated
+  CPU-credit balance** (see below). Charts cover 1 h to 7 days: the last hour
+  from 3 s samples, longer ranges from per-minute averages persisted in
+  `STATE_DIR/panel-history.json` (`PANEL_HISTORY_DAYS`); on first start CPU and
+  steal history are seeded from `atop` logs.
 - **Processes:** top CPU/memory consumers and every agent session (cwd, tty,
   age, command line), with terminate/kill/resume and throttle release.
 - **Watchdog:** layer counters, quota state, active `cpulimit` throttles,
@@ -413,7 +416,7 @@ what it actually runs; a full balance lasts about 3 h at 100% on every vCPU;
 at zero the VM is capped at 30% (40% on KVM 1) and earns nothing until it is
 back to 20%. The provider does not expose the balance, so the panel estimates
 it from the guest's own non-idle CPU time (`/proc/stat`, steal excluded): on
-first start it replays the last 72 h of `atop` logs, then tracks live and
+first start it replays the last 7 days of `atop` logs, then tracks live and
 persists the estimate in `STATE_DIR/panel-credits.json`. The overview shows
 the balance, whether it is draining or refilling and how long all vCPUs can
 run flat out. Tune `PANEL_CREDIT_*` in `/etc/cpu-watchdog-panel.conf` for

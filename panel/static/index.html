@@ -42,9 +42,22 @@
   <main>
     <section data-panel="overview">
       <div id="tiles" class="tiles"></div>
+      <div class="range-bar">
+        <span class="muted small">Charts</span>
+        <div class="seg" id="range">
+          <button data-range="3600">1h</button>
+          <button data-range="10800">3h</button>
+          <button data-range="21600">6h</button>
+          <button data-range="43200">12h</button>
+          <button data-range="86400">24h</button>
+          <button data-range="259200">3d</button>
+          <button data-range="604800">7d</button>
+        </div>
+        <span id="range-note" class="muted small"></span>
+      </div>
       <div class="charts">
         <div class="card chart-card">
-          <div class="chart-head"><h3>Host CPU</h3><span class="muted small">% of total capacity · up to 60 min</span></div>
+          <div class="chart-head"><h3>Host CPU</h3><span class="muted small">% of total capacity</span></div>
           <div class="legend" id="legend-cpu"></div>
           <div class="chart" id="chart-cpu"></div>
         </div>
@@ -54,13 +67,13 @@
           <div class="chart" id="chart-agents"></div>
         </div>
         <div class="card chart-card">
-          <div class="chart-head"><h3>CPU credits (estimated)</h3><span class="muted small">% of balance · up to 24 h · provider limit lifts at the dashed line</span></div>
+          <div class="chart-head"><h3>CPU credits (estimated)</h3><span class="muted small">% of balance · provider limit lifts at the dashed line</span></div>
           <div class="legend" id="legend-credits"></div>
           <div class="chart" id="chart-credits"></div>
           <p class="muted small" id="credits-note"></p>
         </div>
         <div class="card chart-card">
-          <div class="chart-head"><h3>Memory</h3><span class="muted small">% · up to 60 min</span></div>
+          <div class="chart-head"><h3>Memory</h3><span class="muted small">%</span></div>
           <div class="legend" id="legend-mem"></div>
           <div class="chart" id="chart-mem"></div>
         </div>

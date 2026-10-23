@@ -14,6 +14,7 @@ let token = store.get("cwp-token") || "";
 let status = null;
 let samples = [];
 let creditSamples = [];
+let range = Number(new URLSearchParams(location.search).get("range")) || Number(store.get("cwp-range")) || 3600;
 let config = null;
 let cfgEdits = {};
 let tab = store.get("cwp-tab") || "overview";
@@ -141,19 +142,34 @@ async function refresh() {
 }
 async function refreshHistory() {
   try {
-    samples = await api("/api/history");
-    if (status?.credits) creditSamples = (await api("/api/credits")).map(([t, v]) => ({ t, credits: v }));
+    samples = await api(`/api/history?range=${range}`);
+    if (status?.credits) creditSamples = await api(`/api/credits?range=${range}`);
     renderCharts();
   } catch { /* next poll retries */ }
 }
+
+let historyTimer = null;
+function scheduleHistory() {
+  clearInterval(historyTimer);
+  historyTimer = setInterval(refreshHistory, range <= 10800 ? 15000 : 60000);
+}
+
+function setRange(r) {
+  range = r;
+  store.set("cwp-range", String(r));
+  for (const b of $$("#range button")) b.classList.toggle("active", Number(b.dataset.range) === r);
+  $("#range-note").textContent = r > 3600 ? "minute averages" : "3 s samples";
+  refreshHistory();
+  scheduleHistory();
+}
+$("#range").addEventListener("click", (e) => { if (e.target.dataset.range) setRange(Number(e.target.dataset.range)); });
 function start() {
   $("#login").hidden = true;
   $("#app").hidden = false;
   setTab(tab);
-  refresh().then(refreshHistory);
+  refresh().then(() => setRange(range));
   clearInterval(polling);
   polling = setInterval(() => { refresh(); }, 3000);
-  setInterval(refreshHistory, 15000);
   setInterval(renderOverrides, 1000);
 }
 
@@ -328,7 +344,7 @@ function drawChart(c) {
     svg += `<text class="axis-label" x="${pad.l - 6}" y="${yy + 3}" text-anchor="end">${Math.round(v)}%</text>`;
   }
   const mins = Math.round((t1 - t0) / 60);
-  const span = mins >= 120 ? `-${Math.round(mins / 60)} h` : `-${mins} min`;
+  const span = mins >= 2880 ? `-${Math.round(mins / 1440)} d` : mins >= 120 ? `-${Math.round(mins / 60)} h` : `-${mins} min`;
   svg += `<text class="axis-label" x="${pad.l}" y="${H - 4}">${span}</text><text class="axis-label" x="${W - pad.r}" y="${H - 4}" text-anchor="end">now</text>`;
   if (c.ref) {
     const r = c.ref();
@@ -350,7 +366,8 @@ function drawChart(c) {
     cross.setAttribute("x1", x(best.t)); cross.setAttribute("x2", x(best.t)); cross.setAttribute("visibility", "visible");
     const rows = c.series.map((s) => `<div class="t-row"><span class="sw" style="display:inline-block;width:10px;height:3px;border-radius:2px;background:var(${s.color})"></span>${esc(s.label)}<b>${fmtPct(best[s.key], 1)}</b></div>`);
     if (c.refKey) rows.push(`<div class="t-row">${esc(c.refKey.label)}<b>${best[c.refKey.key] == null ? "none" : best[c.refKey.key] + "%"}</b></div>`);
-    tip.innerHTML = `<div class="muted">${new Date(best.t * 1000).toLocaleTimeString()}</div>` + rows.join("");
+    const when = new Date(best.t * 1000);
+    tip.innerHTML = `<div class="muted">${range > 86400 ? when.toLocaleString() : when.toLocaleTimeString()}</div>` + rows.join("");
     tip.hidden = false;
     tip.style.left = Math.min(window.innerWidth - tip.offsetWidth - 8, ev.clientX + 14) + "px";
     tip.style.top = (ev.clientY + 14) + "px";

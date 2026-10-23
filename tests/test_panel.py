@@ -225,7 +225,7 @@ class CreditTests(Fixture):
         samples = self.m.atop_samples(atop, 48)
         if not samples:
             self.skipTest("too early in the day for a sample")
-        self.assertTrue(all(abs(c - 8.0) < 1e-9 and dt == 600 for _t, dt, c in samples))
+        self.assertTrue(all(abs(c - 8.0) < 1e-9 and dt == 600 and st == 0 for _t, dt, c, st in samples))
         k = self.model(8)
         k.backfilling = True
         k.pending = [(0.0, 600.0)]
@@ -235,6 +235,42 @@ class CreditTests(Fixture):
         if drained > 0:
             self.assertAlmostEqual(k.balance, min(k.cap, drained + 4.8 * 600))
         self.assertFalse(k.backfilling)
+
+
+class HistoryTests(Fixture):
+    def test_downsample_averages_into_buckets(self):
+        pts = [{"t": t, "busy": float(t % 2), "agents": None} for t in range(1000, 2200)]
+        out = self.m.downsample(pts, 1000, bins=100)
+        self.assertLessEqual(len(out), 101)
+        self.assertTrue(all(abs(p["busy"] - 0.5) < 0.1 for p in out[:-1]))
+        self.assertNotIn("agents", out[0])
+        self.assertEqual(self.m.downsample(pts, 2150, bins=100), pts[-50:])
+
+    def test_minute_history_flushes_persists_and_seeds(self):
+        path = os.path.join(self.tmp, "hist.json")
+        h = self.m.MinuteHistory(path, 1)
+        for t in range(6000, 6180, 3):
+            h.add({"t": t, "busy": 10.0 if t < 6060 else 30.0})
+        snap = h.snapshot()
+        self.assertEqual([p["t"] for p in snap], [6000, 6060])
+        self.assertEqual([p["busy"] for p in snap], [10.0, 30.0])
+        h.seed([{"t": 5400, "busy": 50.0}, {"t": 6000, "busy": 99.0}])
+        self.assertEqual([p["t"] for p in h.snapshot()], [5400, 6000, 6060])
+        h2 = self.m.MinuteHistory(path, 1)
+        self.assertTrue(h2.load())
+        self.assertEqual(len(h2.snapshot()), 3)
+
+    def test_history_range_uses_minutes_beyond_raw_window(self):
+        now = time.time()
+        self.p.sampler.minutes.seed([{"t": int(now - 7200 + 60 * i), "busy": 40.0} for i in range(100)])
+        with self.p.sampler.lock:
+            self.p.sampler.history.clear()
+            for i in range(10):
+                self.p.sampler.history.append({"t": int(now - 30 + 3 * i), "busy": 80.0})
+        long = self.p.history(3 * 3600)
+        self.assertEqual(long[0]["busy"], 40.0)
+        self.assertEqual(long[-1]["busy"], 80.0)
+        self.assertTrue(all(p["busy"] == 80.0 for p in self.p.history(300)))
 
 
 class GovernorTests(Fixture):

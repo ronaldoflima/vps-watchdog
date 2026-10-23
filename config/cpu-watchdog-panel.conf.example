@@ -45,4 +45,6 @@ PANEL_CREDIT_BURST_HOURS=3
 PANEL_CREDIT_RECOVER_PCT=20
 PANEL_ATOP_DIR=/var/log/atop
 # History replayed on first start; start it after a quiet period (full balance).
-PANEL_CREDIT_REPLAY_HOURS=72
+# Minute history kept for the charts (also seeded from atop on first start).
+PANEL_HISTORY_DAYS=7
+PANEL_CREDIT_REPLAY_HOURS=168
