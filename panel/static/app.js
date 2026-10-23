@@ -89,6 +89,7 @@ function fillDurations() {
   $("#q-quota-dur").value = "10";
   $("#q-pause-dur").value = "10";
   $("#free-dur").value = "30";
+  $("#q-gov-dur").value = "";
 }
 const dur = (sel) => ($(sel).value ? Number($(sel).value) : 0);
 
@@ -219,6 +220,13 @@ function creditTile(c) {
   return tile({ label: "CPU credits (est.)", value: fmtPct(c.balance_pct), sub: `${sub}<br>baseline ${c.baseline_cores} cores · using ${c.use_cores ?? "–"}`, lvl, meter: c.balance_pct });
 }
 
+function governorText(g) {
+  if (!g || !g.enabled) return "Credit governor off: the agent quota follows the fixed Layer 2b policy.";
+  if (g.allowed_cores == null) return "Credit governor on: collecting samples…";
+  const q = g.quota_pct == null ? "uncapped" : `${g.quota_pct}%`;
+  return `Credit governor ${g.observe ? "(observe mode, not applied)" : "on"}: the balance sustains ${g.allowed_cores} cores over ${g.horizon_min} min; other processes use ${g.others_cores}, so the agent quota is ${q}.`;
+}
+
 function renderCreditNote() {
   const c = status?.credits;
   const el = $("#credits-note");
@@ -227,6 +235,7 @@ function renderCreditNote() {
   const parts = [
     `Spending more than ${c.baseline_cores} cores drains the balance; less refills it.`,
     c.burst_full_min != null ? `With the current balance all ${c.vcpus} vCPUs can run flat out for ${fmtMin(c.burst_full_min)}.` : "",
+    governorText(status.governor),
     `Source: ${c.backfilling ? "replaying atop history…" : c.source}. Hostinger does not publish the real balance; this follows its documented model.`,
   ];
   el.textContent = parts.filter(Boolean).join(" ");
@@ -255,6 +264,9 @@ function renderOverview() {
   $("#tiles").innerHTML = tiles.join("");
   $("#groups").innerHTML = `<tr><th>Command</th><th class="num">Processes</th></tr>` +
     status.top_comm.map(([c, n]) => `<tr><td>${esc(c)}</td><td class="num">${n}</td></tr>`).join("");
+  const g = status.governor;
+  $("#gov-state").textContent = g?.enabled ? `on · agent quota ${g.quota_pct == null ? "uncapped" : g.quota_pct + "%"}` : "off";
+  $("#q-quota").disabled = !!(g?.enabled && !g.observe);
   if (document.activeElement !== $("#q-quota") && !$("#q-quota").value) $("#q-quota").placeholder = (quota ?? th.AGENT_CPU_QUOTA_PCT) + "%";
 }
 
@@ -493,6 +505,10 @@ $(".quick").addEventListener("click", (e) => {
     const v = $("#q-quota").value.trim();
     if (!v) return toast("Type a quota in % (100 = one core).", true);
     act("/api/action", { action: "quota", value: v, duration_min: dur("#q-quota-dur") });
+  }
+  if (q === "gov-on" || q === "gov-off") {
+    act("/api/config", { changes: { CREDIT_GOVERNOR: q === "gov-on" ? "1" : "0" }, duration_min: dur("#q-gov-dur") });
+    config = null;
   }
   if (q === "quota-off") act("/api/action", { action: "quota", value: "", duration_min: dur("#q-quota-dur") });
   if (q === "pause") act("/api/action", { action: "timer", op: "stop", duration_min: dur("#q-pause-dur") },

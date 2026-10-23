@@ -53,6 +53,7 @@ PANEL_DEFAULTS = {
     "PANEL_CREDIT_BURST_HOURS": "3",
     "PANEL_CREDIT_RECOVER_PCT": "20",
     "PANEL_ATOP_DIR": "/var/log/atop",
+    "PANEL_CREDIT_REPLAY_HOURS": "72",
     "WATCHDOG_CONF": "/etc/cpu-watchdog.conf",
     "WATCHDOG_CTL": "/usr/local/bin/cpu-watchdog-ctl",
     "EARLYOOM_DEFAULT": "/etc/default/earlyoom",
@@ -94,6 +95,13 @@ SCHEMA = [
      "CPUQuota for the agent slice while Layer 2 is high (100 = one core). 0 disables."),
     ("Layer 2b - agent quota", "AGENT_SLICE", "str", "cpu-watchdog-agents.slice",
      "systemd slice holding agent processes."),
+    ("Credit governor", "CREDIT_GOVERNOR", "enum:0,1", "0",
+     "1 = the panel sizes the agent quota from the estimated credit balance every 30 s "
+     "(Layer 2 then triggers on what the balance can sustain). Needs the panel running."),
+    ("Credit governor", "CREDIT_HORIZON_MIN", "int", "120",
+     "Spend the balance over at least this long: allowed CPU = baseline + balance / horizon."),
+    ("Credit governor", "CREDIT_GOV_MIN_QUOTA_PCT", "int", "100",
+     "Agent quota never goes below this (100 = one core)."),
     ("Release", "RELEASE_SUSTAIN_CHECKS", "int", "3",
      "Minutes of low usage before a throttle or quota is lifted. 0 disables release."),
     ("Release", "RELEASE_IDLE_PCT", "int", "50",
@@ -338,9 +346,9 @@ def validate_value(key, value, nproc):
         if not re.fullmatch(r"\d{1,7}", value):
             raise ValueError("%s: expected a non-negative integer" % key)
         n = int(value)
-        if key.endswith("_PCT") and key != "AGENT_CPU_QUOTA_PCT" and n > 100:
+        if key.endswith("_PCT") and key not in ("AGENT_CPU_QUOTA_PCT", "CREDIT_GOV_MIN_QUOTA_PCT") and n > 100:
             raise ValueError("%s: percentage above 100" % key)
-        if key == "AGENT_CPU_QUOTA_PCT" and n > nproc * 100:
+        if key in ("AGENT_CPU_QUOTA_PCT", "CREDIT_GOV_MIN_QUOTA_PCT") and n > nproc * 100:
             raise ValueError("%s: above %d (nproc x 100)" % (key, nproc * 100))
         return str(n)
     if kind.startswith("enum:"):
@@ -376,8 +384,9 @@ class CreditModel:
     One credit is one vCPU-second at 100%. The VM earns BASELINE% x vCPUs credits per
     second and spends the busy core-seconds it actually ran. Capacity is
     BURST_HOURS x 3600 x (vCPUs - baseline cores), i.e. the time a full balance lasts at
-    100% on every vCPU. At zero the provider caps the VM at THROTTLE% of its vCPUs and
-    earns nothing while capped, until the balance is back to RECOVER% of capacity.
+    100% on every vCPU. At zero the provider caps the VM at THROTTLE% of its vCPUs until
+    the balance is back to RECOVER% of capacity; nothing is earned while the VM is
+    pressing against that cap.
     The provider does not expose the real balance, so this is an estimate."""
 
     def __init__(self, conf, nproc, path):
@@ -399,7 +408,8 @@ class CreditModel:
         self.last_saved = 0
 
     def step(self, consumed, dt):
-        earn = 0.0 if self.throttled else self.base * dt
+        at_cap = self.throttled and consumed / dt >= 0.9 * self.limit
+        earn = 0.0 if at_cap else self.base * dt
         self.balance = min(self.cap, max(0.0, self.balance + earn - consumed))
         if self.balance <= 0:
             self.throttled = True
@@ -499,7 +509,8 @@ class CreditModel:
 def atop_samples(atop_dir, hours, hz_cores=100.0):
     """(epoch, interval seconds, busy cores) from atop raw logs of the last HOURS hours."""
     since = time.time() - hours * 3600
-    days = sorted({time.strftime("%Y%m%d", time.localtime(x)) for x in (since, since + 86400, time.time())})
+    days = sorted({time.strftime("%Y%m%d", time.localtime(x))
+                   for x in range(int(since), int(time.time()) + 86400, 86400)})
     samples = []
     for day in days:
         path = os.path.join(atop_dir, "atop_" + day)
@@ -560,7 +571,8 @@ class Sampler(threading.Thread):
                 threading.Thread(target=self.backfill_credits, daemon=True).start()
 
     def backfill_credits(self):
-        samples = atop_samples(self.panel.conf["PANEL_ATOP_DIR"], 48)
+        samples = atop_samples(self.panel.conf["PANEL_ATOP_DIR"],
+                               int(self.panel.conf["PANEL_CREDIT_REPLAY_HOURS"]))
         if samples:
             hours = (samples[-1][0] - samples[0][0]) / 3600
             self.credits.backfill(samples, "replayed %.0f h of atop history, then live" % hours)
@@ -808,6 +820,8 @@ class Panel:
         self.sampler = Sampler(self)
         self.audit_lock = threading.Lock()
         self.override_lock = threading.Lock()
+        self.gov = {"enabled": False}
+        self.gov_quota = "unset"
 
     def load_token(self):
         path = self.conf["PANEL_TOKEN_FILE"]
@@ -927,6 +941,7 @@ class Panel:
             "allow_reboot": self.conf["PANEL_ALLOW_REBOOT"] == "1",
             "overrides": [{k: v for k, v in o.items() if k != "data"} for o in self.load_overrides()],
             "credits": self.credit_summary(),
+            "governor": self.gov,
         }
 
     def credit_summary(self):
@@ -1122,6 +1137,81 @@ class Panel:
             self.audit("override made permanent: %s" % oid)
         return {"ok": True, "message": "Change kept permanently."}
 
+    # --- credit governor ---
+
+    GOV_MARGIN_CORES = 0.25
+
+    def governor_file(self):
+        return os.path.join(self.state_dir(), "credit-governor")
+
+    def governor_decide(self, vals, summary, total_cores, agent_cores):
+        """Allowed host CPU and the agent quota (None = uncapped), in cores/percent."""
+        c = self.sampler.credits
+        horizon = max(1, int(vals.get("CREDIT_HORIZON_MIN") or 120))
+        floor = int(vals.get("CREDIT_GOV_MIN_QUOTA_PCT") or 100)
+        if summary["throttled_est"]:
+            allowed = c.limit
+        else:
+            allowed = min(c.n, c.base + summary["balance_s"] / (horizon * 60.0))
+        others = max(0.0, total_cores - agent_cores)
+        quota = int(round((allowed - others - self.GOV_MARGIN_CORES) * 100 / 25.0)) * 25
+        quota = max(floor, quota)
+        if allowed >= c.n - 1e-6 or quota >= c.n * 100:
+            return allowed, others, None
+        return allowed, others, quota
+
+    def governor_tick(self):
+        vals = self.watchdog_values()
+        c = self.sampler.credits
+        enabled = vals.get("CREDIT_GOVERNOR") == "1" and c is not None and not c.backfilling
+        observe = vals.get("MODE", "active") == "observe"
+        if not enabled:
+            if self.gov.get("enabled"):
+                try:
+                    os.unlink(self.governor_file())
+                except OSError:
+                    pass
+                if not observe:
+                    self.set_quota("", quiet=True)
+                self.audit("governor off -> agent quota released, fixed policy restored")
+            self.gov = {"enabled": False}
+            self.gov_quota = "unset"
+            return
+        with self.sampler.lock:
+            recent = list(self.sampler.history)[-20:]
+        if len(recent) < 5:
+            return
+        n = c.n
+        total = sum(r["busy"] for r in recent) / len(recent) * n / 100
+        agents = [r["agents"] for r in recent if r.get("agents") is not None]
+        agent_cores = sum(agents) / len(agents) / 100 if agents else 0.0
+        summary = c.summary()
+        allowed, others, quota = self.governor_decide(vals, summary, total, agent_cores)
+        self.gov = {"enabled": True, "observe": observe, "allowed_cores": round(allowed, 2),
+                    "others_cores": round(others, 2), "agents_cores": round(agent_cores, 2),
+                    "quota_pct": quota, "balance_pct": summary["balance_pct"],
+                    "horizon_min": int(vals.get("CREDIT_HORIZON_MIN") or 120), "t": int(time.time())}
+        if observe:
+            return
+        if quota != self.gov_quota:
+            prev = self.gov_quota
+            self.set_quota("" if quota is None else str(quota), quiet=True)
+            self.gov_quota = quota
+            big = prev == "unset" or prev is None or quota is None or abs(quota - prev) >= 100
+            if big:
+                self.audit("governor agent quota %s (balance %.0f%%, allowed %.1f cores, others %.1f)" % (
+                    "uncapped" if quota is None else "%d%%" % quota, summary["balance_pct"], allowed, others))
+        atomic_write(self.governor_file(), "%d\t%d\t%.1f\t%d\n" % (
+            time.time(), allowed * 100, summary["balance_pct"], quota or 0), 0o600)
+
+    def governor_loop(self):
+        while True:
+            time.sleep(30)
+            try:
+                self.governor_tick()
+            except Exception as e:
+                sys.stderr.write("governor error: %s\n" % e)
+
     def reverter(self):
         while True:
             time.sleep(10)
@@ -1175,13 +1265,14 @@ class Panel:
         self.audit("panel units=%s" % units)
         return {"ok": True, "message": "Managed units updated."}
 
-    def set_quota(self, pct):
+    def set_quota(self, pct, quiet=False):
         slice_name = self.watchdog_value("AGENT_SLICE")
         value = "" if pct in ("", "0", None) else "%s%%" % int(pct)
         rc, out = run(["systemctl", "set-property", "--runtime", slice_name, "CPUQuota=" + value])
         if rc != 0:
             raise ValueError("set-property failed: %s" % out)
-        self.audit("quota %s=%s" % (slice_name, value or "none"))
+        if not quiet:
+            self.audit("quota %s=%s" % (slice_name, value or "none"))
         return "Agent slice quota now %s." % (value or "unlimited")
 
     def action(self, body):
@@ -1205,6 +1296,9 @@ class Panel:
                 res["message"] += " Resumes automatically in %d min." % minutes
             return res
         if a == "quota":
+            if self.gov.get("enabled") and not self.gov.get("observe"):
+                raise ValueError("The credit governor manages the agent quota. Turn it off "
+                                 "(permanently or for a while) before setting the quota by hand.")
             value = str(body.get("value", "")).rstrip("%")
             if value and not value.isdigit():
                 raise ValueError("quota must be a number")
@@ -1489,6 +1583,7 @@ def main():
     panel = Panel()
     panel.sampler.start()
     threading.Thread(target=panel.reverter, daemon=True).start()
+    threading.Thread(target=panel.governor_loop, daemon=True).start()
     Handler.panel = panel
     bind, port = panel.conf["PANEL_BIND"], int(panel.conf["PANEL_PORT"])
     family = socket.AF_INET6 if ":" in bind else socket.AF_INET

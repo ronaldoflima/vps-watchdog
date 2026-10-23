@@ -70,6 +70,13 @@
           <h3>Quick actions</h3>
           <div class="quick">
             <div class="row">
+              <label>Credit governor</label>
+              <select class="duration" id="q-gov-dur"></select>
+              <button data-quick="gov-on" class="primary">Turn on</button>
+              <button data-quick="gov-off">Turn off</button>
+              <span id="gov-state" class="muted small"></span>
+            </div>
+            <div class="row">
               <label>Agent quota</label>
               <input id="q-quota" type="number" min="0" step="50" placeholder="%">
               <select class="duration" id="q-quota-dur"></select>

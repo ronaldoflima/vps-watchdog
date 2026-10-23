@@ -173,12 +173,22 @@ class CreditTests(Fixture):
         self.assertTrue(k8.throttled)
         self.assertEqual(k8.balance, 0)
 
-    def test_no_earning_while_capped_until_recover_threshold(self):
+    def test_no_earning_while_pressing_the_cap(self):
+        k8 = self.model(8)
+        k8.balance, k8.throttled = 0, True
+        k8.step(k8.limit * 600, 600)
+        self.assertEqual(k8.balance, 0)
+        self.assertTrue(k8.throttled)
+
+    def test_earning_below_the_cap_lifts_at_recover_threshold(self):
         k8 = self.model(8)
         k8.balance, k8.throttled = 0, True
         k8.step(0, 600)
-        self.assertEqual(k8.balance, 0)
+        self.assertAlmostEqual(k8.balance, 4.8 * 600)
         self.assertTrue(k8.throttled)
+        while k8.throttled:
+            k8.step(0, 600)
+        self.assertGreaterEqual(k8.balance, 0.2 * k8.cap)
 
     def test_live_updates_save_and_resume_after_restart(self):
         k = self.model(8)
@@ -225,6 +235,69 @@ class CreditTests(Fixture):
         if drained > 0:
             self.assertAlmostEqual(k.balance, min(k.cap, drained + 4.8 * 600))
         self.assertFalse(k.backfilling)
+
+
+class GovernorTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        c = self.p.sampler.credits
+        c.backfilling = False
+        c.n, c.base, c.limit = 8.0, 4.8, 2.4
+        c.cap = 3 * 3600 * 3.2
+        self.quotas = []
+        self.p.set_quota = lambda pct, quiet=False: self.quotas.append(pct)
+
+    def decide(self, balance_pct, others, throttled=False, **vals):
+        summary = {"balance_s": self.p.sampler.credits.cap * balance_pct / 100, "throttled_est": throttled}
+        return self.p.governor_decide(vals, summary, others + 2.0, 2.0)
+
+    def test_full_balance_leaves_agents_uncapped(self):
+        allowed, _o, quota = self.decide(100, 1.0)
+        self.assertAlmostEqual(allowed, 8.0)
+        self.assertIsNone(quota)
+
+    def test_low_balance_spreads_it_over_the_horizon(self):
+        allowed, others, quota = self.decide(20, 1.0)
+        self.assertAlmostEqual(allowed, 4.8 + 6912 / 7200.0)
+        self.assertEqual(quota, 450)
+        allowed, _o, quota = self.decide(20, 1.0, CREDIT_HORIZON_MIN="10")
+        self.assertAlmostEqual(allowed, 8.0)
+        self.assertIsNone(quota)
+
+    def test_throttled_uses_provider_cap_and_floor(self):
+        allowed, _o, quota = self.decide(0, 2.0, throttled=True, CREDIT_GOV_MIN_QUOTA_PCT="150")
+        self.assertAlmostEqual(allowed, 2.4)
+        self.assertEqual(quota, 150)
+
+    def fill_history(self, busy_pct, agents_pct):
+        with self.p.sampler.lock:
+            for i in range(20):
+                self.p.sampler.history.append({"t": i, "busy": busy_pct, "agents": agents_pct})
+
+    def test_tick_publishes_file_applies_quota_and_releases_when_disabled(self):
+        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "1"}})
+        self.p.sampler.credits.balance = self.p.sampler.credits.cap * 0.2
+        self.fill_history(50.0, 300.0)
+        self.p.governor_tick()
+        self.assertEqual(self.quotas, ["450"])
+        epoch, allowed, _bal, quota = read(os.path.join(self.state, "credit-governor")).split()
+        self.assertEqual((allowed, quota), ("576", "450"))
+        with self.assertRaises(ValueError):
+            self.p.action({"action": "quota", "value": "500"})
+        self.p.governor_tick()
+        self.assertEqual(self.quotas, ["450"], "unchanged quota is not reapplied")
+        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "0"}})
+        self.p.governor_tick()
+        self.assertEqual(self.quotas, ["450", ""])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "credit-governor")))
+
+    def test_observe_mode_computes_without_applying(self):
+        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "1", "MODE": "observe"}})
+        self.fill_history(50.0, 300.0)
+        self.p.governor_tick()
+        self.assertEqual(self.quotas, [])
+        self.assertTrue(self.p.gov["observe"])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "credit-governor")))
 
 
 class TmuxTests(Fixture):

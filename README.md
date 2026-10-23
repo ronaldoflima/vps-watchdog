@@ -413,11 +413,28 @@ what it actually runs; a full balance lasts about 3 h at 100% on every vCPU;
 at zero the VM is capped at 30% (40% on KVM 1) and earns nothing until it is
 back to 20%. The provider does not expose the balance, so the panel estimates
 it from the guest's own non-idle CPU time (`/proc/stat`, steal excluded): on
-first start it replays the last 48 h of `atop` logs, then tracks live and
+first start it replays the last 72 h of `atop` logs, then tracks live and
 persists the estimate in `STATE_DIR/panel-credits.json`. The overview shows
 the balance, whether it is draining or refilling and how long all vCPUs can
 run flat out. Tune `PANEL_CREDIT_*` in `/etc/cpu-watchdog-panel.conf` for
 other plans or providers, or set `PANEL_CREDIT_MODEL=0`.
+
+### Credit governor
+
+With `CREDIT_GOVERNOR=1` (Config tab, or *Credit governor → Turn on* in the
+overview, also temporarily) the panel turns the estimate into policy. Every
+30 s it computes how much CPU the balance can sustain,
+`baseline + balance / CREDIT_HORIZON_MIN`, capped at all vCPUs. It sets
+the agent slice quota to that minus what other processes use, leaving the
+agents uncapped while the balance can sustain every vCPU and never going
+below `CREDIT_GOV_MIN_QUOTA_PCT`. It publishes the allowance in
+`STATE_DIR/credit-governor`, and the watchdog then triggers Layer 2 on that
+allowance instead of the fixed `AGG_CPU_THRESHOLD_PCT` and leaves the quota
+to the panel. The effect is to use the whole VM while credits last and to
+slow down gradually as they run out, approaching the baseline instead of
+hitting the provider's cap. If the panel stops, the file goes stale and the
+watchdog restores the fixed policy within 3 minutes. Manual quota changes
+are refused while the governor is on.
 
 The panel runs as root, so it listens on `127.0.0.1:8790` only and every API
 call needs the bearer token from `/etc/cpu-watchdog-panel.token` (created on
