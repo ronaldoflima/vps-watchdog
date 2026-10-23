@@ -114,9 +114,10 @@
         </div>
         <div class="card">
           <h3>Free a tmux session</h3>
-          <p class="muted small">Lifts every watchdog limit from the processes of a tmux target (session, session:window or session:window.pane).</p>
+          <p class="muted small">Lifts every watchdog limit from the processes of a tmux session, window or pane (any user&#39;s default tmux server).</p>
           <div class="row">
-            <input id="free-target" placeholder="session[:window[.pane]]">
+            <select id="free-target" class="grow"><option value="">Click to load tmux sessions…</option></select>
+            <button id="free-reload" class="small ghost" title="Reload sessions">↻</button>
             <select class="duration" id="free-dur"></select>
             <button id="free-go" class="primary">Free</button>
             <button id="free-undo">Undo</button>

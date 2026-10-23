@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 PANEL_CONF = os.environ.get("CPU_WATCHDOG_PANEL_CONF", "/etc/cpu-watchdog-panel.conf")
 PROC = os.environ.get("CPU_WATCHDOG_PROC_DIR", "/proc")
 CGROUP = os.environ.get("CPU_WATCHDOG_CGROUP_DIR", "/sys/fs/cgroup")
+TMUX_TMPDIR = os.environ.get("CPU_WATCHDOG_TMUX_TMPDIR", "/tmp")
 STATIC_DIR = os.environ.get(
     "CPU_WATCHDOG_PANEL_STATIC",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
@@ -191,9 +192,10 @@ def load_panel_conf():
     return conf
 
 
-def run(cmd, timeout=30):
+def run(cmd, timeout=30, env=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, **env) if env else None)
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, "timeout after %ss" % timeout
@@ -870,7 +872,8 @@ class Panel:
         elif kind == "timer":
             run(["systemctl", "start", "cpu-watchdog.timer"])
         elif kind == "free":
-            run([self.conf["WATCHDOG_CTL"], "free", data["target"], "--undo"])
+            run([self.conf["WATCHDOG_CTL"], "free", data["target"], "--undo"],
+                env={"TMUX_USER": data.get("user") or "root"})
         self.audit("override expired: %s%s" % (item["label"], " (%s)" % "; ".join(notes) if notes else ""))
 
     def expire_overrides(self, force_id=None):
@@ -1018,14 +1021,20 @@ class Panel:
             target = str(body.get("target", ""))
             if not re.fullmatch(r"[A-Za-z0-9_.:@%-]+", target):
                 raise ValueError("invalid tmux target")
+            user = str(body.get("user") or "root")
+            try:
+                pwd.getpwnam(user)
+            except KeyError:
+                raise ValueError("unknown user %r" % user)
             cmd = [self.conf["WATCHDOG_CTL"], "free", target] + (["--undo"] if body.get("undo") else [])
             if minutes and body.get("undo"):
                 raise ValueError("undo cannot be temporary")
-            rc, out = run(cmd)
-            self.audit("free %s%s" % (target, " --undo" if body.get("undo") else ""))
+            rc, out = run(cmd, env={"TMUX_USER": user})
+            self.audit("free %s/%s%s" % (user, target, " --undo" if body.get("undo") else ""))
             res = self.result(rc, out, out)
             if minutes:
-                self.add_override("free", minutes, {"target": target}, "free tmux %s" % target)
+                self.add_override("free", minutes, {"target": target, "user": user},
+                                  "free tmux %s/%s" % (user, target))
                 res["message"] += " Limits return in %d min." % minutes
             return res
         if a == "kill":
@@ -1100,6 +1109,47 @@ class Panel:
         if rc != 0:
             raise ValueError(out or "command failed (%d)" % rc)
         return {"ok": True, "message": ok_message or "Done."}
+
+    def tmux_targets(self):
+        """Sessions, windows and panes of every user's default tmux server."""
+        fmt = "\t".join(["#{session_name}", "#{window_index}", "#{window_name}", "#{pane_index}",
+                         "#{pane_pid}", "#{pane_current_command}", "#{pane_current_path}"])
+        result = []
+        try:
+            dirs = sorted(d for d in os.listdir(TMUX_TMPDIR) if re.fullmatch(r"tmux-\d+", d))
+        except OSError:
+            dirs = []
+        for d in dirs:
+            uid = int(d[5:])
+            if not os.path.exists(os.path.join(TMUX_TMPDIR, d, "default")):
+                continue
+            try:
+                user = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                continue
+            cmd = ["tmux", "list-panes", "-a", "-F", fmt]
+            if uid != os.getuid():
+                cmd = ["runuser", "-u", user, "--"] + cmd
+            rc, out = run(cmd, timeout=10, env={"TMUX_TMPDIR": TMUX_TMPDIR})
+            if rc != 0:
+                continue
+            sessions = collections.OrderedDict()
+            for line in out.splitlines():
+                f = line.split("\t")
+                if len(f) != 7:
+                    continue
+                sess, widx, wname, pidx, ppid, pcmd, path = f
+                win = sessions.setdefault(sess, collections.OrderedDict()).setdefault(
+                    widx, {"name": wname, "panes": []})
+                win["panes"].append({"target": "%s:%s.%s" % (sess, widx, pidx), "pid": int(ppid),
+                                     "command": pcmd, "path": path})
+            for sess, windows in sessions.items():
+                result.append({
+                    "user": user, "session": sess, "target": sess,
+                    "windows": [{"target": "%s:%s" % (sess, w), "name": v["name"], "panes": v["panes"]}
+                                for w, v in windows.items()],
+                })
+        return result
 
     def log_tail(self, n):
         path = self.watchdog_value("LOG_FILE") or "/var/log/cpu-watchdog.log"
@@ -1180,6 +1230,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, self.panel.history())
             if url.path == "/api/config":
                 return self.send(200, self.panel.config())
+            if url.path == "/api/tmux":
+                return self.send(200, {"sessions": self.panel.tmux_targets()})
             if url.path == "/api/log":
                 n = int(parse_qs(url.query).get("n", ["200"])[0])
                 return self.send(200, {"lines": self.panel.log_tail(max(1, min(n, 2000)))})

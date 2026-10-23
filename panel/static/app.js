@@ -397,8 +397,55 @@ async function loadLog() {
 }
 $("#log-refresh").addEventListener("click", loadLog);
 $("#log-filter").addEventListener("input", loadLog);
-$("#free-go").addEventListener("click", () => act("/api/action", { action: "free", target: $("#free-target").value.trim(), duration_min: dur("#free-dur") }));
-$("#free-undo").addEventListener("click", () => act("/api/action", { action: "free", target: $("#free-target").value.trim(), undo: true }));
+let tmuxLoaded = 0;
+async function loadTmux(force = false) {
+  if (!force && Date.now() - tmuxLoaded < 15000) return;
+  const sel = $("#free-target");
+  const keep = sel.value;
+  tmuxLoaded = Date.now();
+  try {
+    const { sessions } = await api("/api/tmux");
+    const groups = {};
+    for (const s of sessions) (groups[s.user] ||= []).push(s);
+    let html = `<option value="">${sessions.length ? "Choose a session, window or pane…" : "No tmux sessions found"}</option>`;
+    for (const [user, list] of Object.entries(groups)) {
+      html += `<optgroup label="${esc(user)}">`;
+      for (const s of list) {
+        html += `<option value="${esc(user + "|" + s.target)}">${esc(s.session)} — whole session (${s.windows.length} windows)</option>`;
+        for (const w of s.windows) {
+          html += `<option value="${esc(user + "|" + w.target)}">\u00a0\u00a0${esc(w.target)} ${esc(w.name)}</option>`;
+          if (w.panes.length > 1) {
+            for (const p of w.panes) {
+              html += `<option value="${esc(user + "|" + p.target)}">\u00a0\u00a0\u00a0\u00a0${esc(p.target)} ${esc(p.command)} · ${esc(p.path)}</option>`;
+            }
+          }
+        }
+      }
+      html += `</optgroup>`;
+    }
+    sel.innerHTML = html;
+    if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+  } catch (e) {
+    tmuxLoaded = 0;
+    if (e.message !== "unauthorized") toast(e.message, true);
+  }
+}
+function freeTarget() {
+  const [user, target] = $("#free-target").value.split("|");
+  if (!target) { toast("Choose a tmux session first.", true); return null; }
+  return { user, target };
+}
+$("#free-target").addEventListener("mousedown", () => loadTmux());
+$("#free-target").addEventListener("focus", () => loadTmux());
+$("#free-reload").addEventListener("click", () => loadTmux(true));
+$("#free-go").addEventListener("click", () => {
+  const t = freeTarget();
+  if (t) act("/api/action", { action: "free", ...t, duration_min: dur("#free-dur") });
+});
+$("#free-undo").addEventListener("click", () => {
+  const t = freeTarget();
+  if (t) act("/api/action", { action: "free", ...t, undo: true });
+});
 
 /* ---------- quick actions ---------- */
 

@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -146,6 +147,47 @@ class OverrideTests(Fixture):
     def test_secret_cannot_be_temporary(self):
         with self.assertRaises(ValueError):
             self.p.save_config({"changes": {"TELEGRAM_BOT_TOKEN": "x"}, "duration_min": 5})
+
+
+class TmuxTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.ctl = os.path.join(self.tmp, "ctl")
+        with open(self.ctl, "w") as f:
+            f.write('#!/bin/sh\necho "$TMUX_USER $*" >>"%s/ctl.log"\n' % self.tmp)
+        os.chmod(self.ctl, 0o755)
+        self.p.conf["WATCHDOG_CTL"] = self.ctl
+        self.user = __import__("pwd").getpwuid(os.getuid()).pw_name
+
+    def test_free_passes_user_and_reverts_with_it(self):
+        self.p.action({"action": "free", "user": self.user, "target": "work:2", "duration_min": 5})
+        oid = self.p.load_overrides()[0]["id"]
+        self.p.override_action({"id": oid, "op": "revert"})
+        self.assertEqual(read(os.path.join(self.tmp, "ctl.log")).splitlines(),
+                         ["%s free work:2" % self.user, "%s free work:2 --undo" % self.user])
+
+    def test_free_rejects_bad_input(self):
+        for body in ({"target": "a;b", "user": self.user}, {"target": "work", "user": "no-such-user-zz"}):
+            with self.assertRaises(ValueError):
+                self.p.action(dict(body, action="free"))
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+    def test_lists_sessions_windows_and_panes(self):
+        tmpdir = os.path.join(self.tmp, "tmux")
+        os.makedirs(tmpdir)
+        self.m.TMUX_TMPDIR = tmpdir
+        env = dict(os.environ, TMUX_TMPDIR=tmpdir)
+        env.pop("TMUX", None)
+        subprocess.run(["tmux", "-f", "/dev/null", "new-session", "-d", "-s", "work", "-n", "editor", "sleep 60"], env=env, check=True)
+        try:
+            subprocess.run(["tmux", "split-window", "-t", "work:0", "sleep 60"], env=env, check=True)
+            sessions = self.p.tmux_targets()
+            self.assertEqual([(s["user"], s["target"]) for s in sessions], [(self.user, "work")])
+            win = sessions[0]["windows"][0]
+            self.assertEqual((win["target"], win["name"]), ("work:0", "editor"))
+            self.assertEqual([p["target"] for p in win["panes"]], ["work:0.0", "work:0.1"])
+        finally:
+            subprocess.run(["tmux", "kill-server"], env=env)
 
 
 class HttpTests(Fixture):
