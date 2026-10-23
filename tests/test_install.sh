@@ -5,7 +5,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 prepare_installer() {
     mkdir -p "$T/repo" "$T/root/etc/default"
-    cp -r "$REPO_DIR/bin" "$REPO_DIR/config" "$REPO_DIR/systemd" "$T/repo/"
+    cp -r "$REPO_DIR/bin" "$REPO_DIR/config" "$REPO_DIR/systemd" "$REPO_DIR/panel" "$T/repo/"
     # Redirect absolute destinations only; keep the installer's behavior intact.
     sed -e "s|/usr/local/|$T/root/usr/local/|g" \
         -e "s|/etc/|$T/root/etc/|g" \
@@ -227,6 +227,23 @@ run_test test_observe_upgrade_sets_mode_before_installation_work
 run_test test_observe_replacement_rejected_before_changes
 run_test test_existing_earlyoom_configuration_preserved
 run_test test_explicit_earlyoom_replacement_keeps_unique_backups
+test_panel_is_opt_in_and_rerun_is_idempotent() {
+    prepare_installer
+    touch "$T/installed-cpulimit" "$T/installed-earlyoom"
+    run_installer || { fail "install failed: $(cat "$T/stderr")"; return; }
+    [ ! -e "$T/root/etc/systemd/system/cpu-watchdog-panel.service" ] || fail "panel must be opt-in"
+    INSTALL_ARGS=--with-panel run_installer || { fail "panel install failed: $(cat "$T/stderr")"; return; }
+    [ -x "$T/root/usr/local/lib/cpu-watchdog-panel/cpu-watchdog-panel.py" ] || fail "panel script not installed"
+    [ -f "$T/root/usr/local/lib/cpu-watchdog-panel/static/app.js" ] || fail "panel assets not installed"
+    assert_eq "600" "$(stat -c %a "$T/root/etc/cpu-watchdog-panel.conf")"
+    assert_contains "$(cat "$T/services")" "systemctl enable --now cpu-watchdog-panel.service"
+    : >"$T/services"
+    run_installer || { fail "rerun failed: $(cat "$T/stderr")"; return; }
+    assert_contains "$(cat "$T/services")" "systemctl enable --now cpu-watchdog-panel.service"
+    assert_not_contains "$(cat "$T/services")" "systemctl restart cpu-watchdog-panel.service"
+}
+
+run_test test_panel_is_opt_in_and_rerun_is_idempotent
 run_test test_observe_install_skips_earlyoom_and_preserves_existing_policy
 run_test test_arch_installs_without_cpulimit
 run_test test_debian_installs_missing_dependencies

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cpu-watchdog panel</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="login-form" class="card login-card">
+    <h1>cpu-watchdog panel</h1>
+    <p class="muted">Paste the token from <code>/etc/cpu-watchdog-panel.token</code><br>(<code>sudo cat /etc/cpu-watchdog-panel.token</code>).</p>
+    <input id="token" type="password" autocomplete="off" placeholder="token" required>
+    <button type="submit" class="primary">Open</button>
+    <p id="login-error" class="error"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="brand">
+      <strong>cpu-watchdog</strong>
+      <span id="hostname" class="muted"></span>
+      <span id="mode-badge" class="badge"></span>
+    </div>
+    <nav id="tabs">
+      <button data-tab="overview" class="active">Overview</button>
+      <button data-tab="processes">Processes</button>
+      <button data-tab="watchdog">Watchdog</button>
+      <button data-tab="config">Config</button>
+      <button data-tab="services">Services</button>
+    </nav>
+    <div class="top-right">
+      <span id="updated" class="muted small"></span>
+      <button id="logout" class="ghost small">Log out</button>
+    </div>
+  </header>
+
+  <section id="overrides" class="overrides" hidden></section>
+
+  <main>
+    <section data-panel="overview">
+      <div id="tiles" class="tiles"></div>
+      <div class="charts">
+        <div class="card chart-card">
+          <div class="chart-head"><h3>Host CPU</h3><span class="muted small">% of total capacity · up to 60 min</span></div>
+          <div class="legend" id="legend-cpu"></div>
+          <div class="chart" id="chart-cpu"></div>
+        </div>
+        <div class="card chart-card">
+          <div class="chart-head"><h3>Agent slice</h3><span class="muted small">% of one core · quota as dashed line</span></div>
+          <div class="legend" id="legend-agents"></div>
+          <div class="chart" id="chart-agents"></div>
+        </div>
+        <div class="card chart-card">
+          <div class="chart-head"><h3>Memory</h3><span class="muted small">% · up to 60 min</span></div>
+          <div class="legend" id="legend-mem"></div>
+          <div class="chart" id="chart-mem"></div>
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <h3>Quick actions</h3>
+          <div class="quick">
+            <div class="row">
+              <label>Agent quota</label>
+              <input id="q-quota" type="number" min="0" step="50" placeholder="%">
+              <select class="duration" id="q-quota-dur"></select>
+              <button data-quick="quota" class="primary">Apply</button>
+              <button data-quick="quota-off">Remove cap</button>
+            </div>
+            <div class="row">
+              <label>Watchdog</label>
+              <select class="duration" id="q-pause-dur"></select>
+              <button data-quick="pause">Pause</button>
+              <button data-quick="resume">Resume</button>
+              <button data-quick="run">Run now</button>
+            </div>
+            <div class="row">
+              <label>Throttles</label>
+              <button data-quick="unthrottle-all">Release all cpulimit throttles</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Biggest groups</h3>
+          <table class="compact" id="groups"></table>
+        </div>
+      </div>
+    </section>
+
+    <section data-panel="processes" hidden>
+      <div class="toolbar">
+        <input id="proc-filter" placeholder="Filter by name, cwd, user, command…">
+        <select id="proc-view">
+          <option value="cpu">Top CPU</option>
+          <option value="rss">Top memory</option>
+          <option value="agents">Agent sessions</option>
+          <option value="throttled">Throttled</option>
+        </select>
+        <span id="proc-count" class="muted small"></span>
+      </div>
+      <div class="card table-wrap">
+        <table id="procs"></table>
+      </div>
+    </section>
+
+    <section data-panel="watchdog" hidden>
+      <div class="grid2">
+        <div class="card">
+          <h3>State</h3>
+          <dl id="wd-state" class="kv"></dl>
+        </div>
+        <div class="card">
+          <h3>Free a tmux session</h3>
+          <p class="muted small">Lifts every watchdog limit from the processes of a tmux target (session, session:window or session:window.pane).</p>
+          <div class="row">
+            <input id="free-target" placeholder="session[:window[.pane]]">
+            <select class="duration" id="free-dur"></select>
+            <button id="free-go" class="primary">Free</button>
+            <button id="free-undo">Undo</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Active cpulimit throttles</h3>
+        <table id="throttles"></table>
+      </div>
+      <div class="card">
+        <div class="chart-head"><h3>Log</h3>
+          <div class="row tight">
+            <input id="log-filter" placeholder="filter">
+            <button id="log-refresh" class="small">Refresh</button>
+          </div>
+        </div>
+        <pre id="log" class="log"></pre>
+      </div>
+    </section>
+
+    <section data-panel="config" hidden>
+      <div class="card sticky-actions">
+        <div class="row">
+          <span id="cfg-dirty" class="muted">No changes.</span>
+          <span class="spacer"></span>
+          <label class="check"><input type="checkbox" id="cfg-apply-quota" checked> apply quota now if capped</label>
+          <select class="duration" id="cfg-dur"></select>
+          <button id="cfg-reset">Discard</button>
+          <button id="cfg-restore" title="Swap with the previous version">Restore backup</button>
+          <button id="cfg-save" class="primary" disabled>Save</button>
+        </div>
+        <p class="muted small" id="cfg-path"></p>
+      </div>
+      <div id="cfg-groups"></div>
+      <div class="card">
+        <h3>earlyoom</h3>
+        <p class="muted small" id="eo-path"></p>
+        <textarea id="eo-args" rows="3" spellcheck="false"></textarea>
+        <div class="row"><span class="muted small">Saving restarts earlyoom; if it fails to start the previous arguments are restored.</span><span class="spacer"></span><button id="eo-save" class="primary">Save &amp; restart earlyoom</button></div>
+      </div>
+    </section>
+
+    <section data-panel="services" hidden>
+      <div class="card">
+        <h3>Managed units</h3>
+        <table id="units"></table>
+        <div class="row">
+          <input id="units-edit" class="grow" placeholder="space-separated units; user units as user/name.service">
+          <button id="units-save">Save list</button>
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <h3>Swap</h3>
+          <p class="muted small">Moves swapped pages back into RAM (<code>swapoff -a &amp;&amp; swapon -a</code>). Refused unless available RAM exceeds used swap by 2 GB.</p>
+          <p id="swap-info"></p>
+          <button id="swap-flush">Flush swap</button>
+        </div>
+        <div class="card danger">
+          <h3>Reboot host</h3>
+          <p class="muted small">Type the hostname to confirm. All sessions end.</p>
+          <div class="row">
+            <input id="reboot-confirm" placeholder="hostname">
+            <button id="reboot-go" class="danger-btn">Reboot</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <div id="toast" class="toast" hidden></div>
+  <div id="tooltip" class="tooltip" hidden></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

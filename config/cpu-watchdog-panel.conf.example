@@ -1,0 +1,29 @@
+# cpu-watchdog panel configuration (read at start; restart the panel after edits).
+# The panel runs as root and can edit /etc/cpu-watchdog.conf, signal processes,
+# restart units and reboot the host. Keep it on loopback and reach it through
+# an SSH tunnel: ssh -L 8790:127.0.0.1:8790 <host>
+PANEL_BIND=127.0.0.1
+PANEL_PORT=8790
+
+# Bearer token required by every /api call. Generated on first start (mode 600).
+PANEL_TOKEN_FILE=/etc/cpu-watchdog-panel.token
+
+# Extra Host header values accepted besides 127.0.0.1/localhost/[::1] on PANEL_PORT
+# (DNS rebinding protection), e.g. "panel.internal:8790". Space separated.
+PANEL_ALLOWED_HOSTS=""
+
+# systemd units the panel may start/stop/restart. Also editable from the panel.
+# Prefix a user unit with its owner: "alice/sync.service" runs
+# systemctl --user -M alice@ (the user needs lingering: loginctl enable-linger alice).
+PANEL_UNITS="cpu-watchdog.timer earlyoom cpu-watchdog-panel"
+
+# 1 = show the reboot action (requires typing the hostname).
+PANEL_ALLOW_REBOOT=1
+
+# Sampling interval (seconds) and in-memory history length (minutes).
+PANEL_SAMPLE_SEC=3
+PANEL_HISTORY_MIN=60
+
+WATCHDOG_CONF=/etc/cpu-watchdog.conf
+WATCHDOG_CTL=/usr/local/bin/cpu-watchdog-ctl
+EARLYOOM_DEFAULT=/etc/default/earlyoom

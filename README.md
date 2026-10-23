@@ -317,6 +317,7 @@ existing logs retain their previous permissions. See [SECURITY.md](SECURITY.md).
 | Active throttles | `systemctl list-units 'cpu-watchdog-limit-*'` |
 | earlyoom | `/etc/default/earlyoom` (and `journalctl -u earlyoom`) |
 | tailscaled OOM protection | `/etc/systemd/system/tailscaled.service.d/oom.conf` |
+| Web panel (optional) | `/usr/local/lib/cpu-watchdog-panel/`, `/etc/cpu-watchdog-panel.conf`, `/etc/cpu-watchdog-panel.token`, `cpu-watchdog-panel.service` |
 
 ## Operations
 
@@ -377,6 +378,47 @@ systemctl stop cpu-watchdog-limit-<PID>-<starttime>.scope   # release one thrott
 # or: pkill -f "cpulimit -p <PID>"
 ```
 
+## Web panel (optional)
+
+`sudo ./install.sh --with-panel` adds a small web panel (Python standard
+library, no dependencies) for watching and steering everything above from a
+browser:
+
+- **Overview:** host CPU busy/steal, load, agent slice usage against its quota,
+  agent stall time (cgroup PSI), memory and swap, with one hour of history.
+- **Processes:** top CPU/memory consumers and every agent session (cwd, tty,
+  age, command line), with terminate/kill/resume and throttle release.
+- **Watchdog:** layer counters, quota state, active `cpulimit` throttles,
+  `free` for tmux targets and the log.
+- **Config:** every `/etc/cpu-watchdog.conf` setting grouped by layer, validated
+  before writing (`bash -n`, types, regexes), with a one-step backup restore;
+  earlyoom arguments (rolled back if earlyoom fails to restart).
+- **Services:** start/stop/restart for the units in `PANEL_UNITS`, swap flush
+  and host reboot (requires typing the hostname).
+
+Any config change, quota change, watchdog pause or tmux `free` can be made
+**temporary** ("for 10 min", "for 1 h", ...). The panel records it in
+`STATE_DIR/panel-overrides.json` and reverts it when it expires, also across
+panel restarts. A key changed again in the meantime is left alone. Active
+overrides are listed at the top of every page with *+10 min*, *Revert now* and
+*Keep permanently*.
+
+The panel runs as root, so it listens on `127.0.0.1:8790` only and every API
+call needs the bearer token from `/etc/cpu-watchdog-panel.token` (created on
+first start, mode 600). It also rejects unexpected `Host` headers (DNS
+rebinding) and non-JSON posts. Open it through an SSH tunnel:
+
+```bash
+ssh -L 8790:127.0.0.1:8790 <host>
+# then http://127.0.0.1:8790 and paste the token, or open
+# http://127.0.0.1:8790/#token=<token> (the fragment is never sent to the server)
+```
+
+Every change made from the panel is written to the watchdog log as a
+`PANEL ...` line. Settings live in `/etc/cpu-watchdog-panel.conf` (see
+`config/cpu-watchdog-panel.conf.example`); restart `cpu-watchdog-panel` after
+editing it.
+
 ## Rollback
 
 **Restore an earlier version** (preserves the installed watchdog configuration):
@@ -403,6 +445,8 @@ sudo rm /usr/local/bin/cpu-watchdog.sh /usr/local/bin/cpu-watchdog-ctl
 sudo rm -r /var/lib/cpu-watchdog /run/cpu-watchdog.lock
 sudo cp /etc/cpu-watchdog.conf ~/cpu-watchdog.conf.bak && sudo rm /etc/cpu-watchdog.conf  # contains the token
 sudo rm /etc/systemd/system/tailscaled.service.d/oom.conf   # if present
+sudo systemctl disable --now cpu-watchdog-panel.service 2>/dev/null   # if the panel was installed
+sudo rm -rf /etc/systemd/system/cpu-watchdog-panel.service /usr/local/lib/cpu-watchdog-panel /etc/cpu-watchdog-panel.conf /etc/cpu-watchdog-panel.token
 sudo systemctl daemon-reload
 # earlyoom: disable it, remove the package, or restore your /etc/default/earlyoom
 sudo systemctl disable --now earlyoom
@@ -418,7 +462,7 @@ messages, commit messages, issues and pull requests. See [CONTRIBUTING.md](CONTR
 
 ```bash
 tests/lint.sh   # bash -n, shellcheck, systemd-analyze verify
-tests/run.sh    # layer, sanitization, notification, configuration and installer tests
+tests/run.sh    # layer, sanitization, notification, configuration, installer and panel tests
 ```
 
 Tests require the runtime tools listed above, including `diffutils` for installer
