@@ -522,6 +522,7 @@ class CreditModel:
         self.recent = collections.deque(maxlen=200)
         self.pending = []
         self.backfilling = False
+        self.live_since = None
         self.last_saved = 0
 
     def step(self, consumed, dt):
@@ -568,6 +569,8 @@ class CreditModel:
                     self.pending.append((consumed, dt))
                 self.step(consumed, dt)
                 self.recent.append((t, self.balance, consumed / dt))
+            elif self.backfilling and self.live_since is None:
+                self.live_since = t
             self.last = (busy_s, t)
             if not self.history or t - self.history[-1][0] >= 60:
                 self.history.append((int(t), round(self.balance / self.cap * 100, 2)))
@@ -818,12 +821,26 @@ class Sampler(threading.Thread):
             since = time.time() - replay * 3600
             replayed = [x for x in samples if x[0] >= since]
             if replayed:
+                replayed += self.gap_samples(replayed[-1][0], credits)
                 span = (replayed[-1][0] - replayed[0][0]) / 3600
                 credits.backfill(replayed, "replayed %.0f h of atop history, then live" % span)
             else:
                 with credits.lock:
                     credits.backfilling = False
                     credits.pending = []
+
+    def gap_samples(self, after, credits):
+        """Live 3 s samples between the last atop record and the first step the model saw itself."""
+        with credits.lock:
+            until = credits.live_since
+        with self.lock:
+            raw = [r for r in self.history if r["t"] > after and (until is None or r["t"] <= until)]
+        out, prev = [], after
+        for r in raw:
+            if r.get("busy") is not None and r["t"] > prev:
+                out.append((r["t"], r["t"] - prev, r["busy"] * self.nproc / 100.0, 0.0))
+            prev = r["t"]
+        return out
 
     def _boot_time(self):
         for line in read_file(os.path.join(PROC, "stat")).splitlines():

@@ -502,6 +502,20 @@ class GovernorTests(Fixture):
         self.assertTrue(self.p.gov["enabled"])
         self.assertTrue(self.p.sampler.credits.summary()["replaying"])
 
+    def test_replay_covers_gap_until_live_steps(self):
+        sampler, c = self.p.sampler, self.p.sampler.credits
+        c.backfilling, c.pending, c.last, c.live_since = True, [], None, None
+        with sampler.lock:
+            sampler.history.clear()
+            for t in (995, 1000, 1003, 1006, 1009, 1012):
+                sampler.history.append({"t": t, "busy": 75.0})
+        c.update(100.0, 1009)
+        c.update(103.0 * sampler.nproc / c.n, 1012)
+        gap = sampler.gap_samples(1000, c)
+        self.assertEqual([(t, dt) for t, dt, _b, _s in gap], [(1003, 3), (1006, 3), (1009, 3)])
+        self.assertAlmostEqual(gap[0][2], 0.75 * sampler.nproc)
+        self.assertEqual(len(c.pending), 1)
+
     def test_reserve_settles_balance_above_zero(self):
         allowed, _o, _q = self.decide(20, 1.0, CREDIT_GOV_RESERVE_PCT="20")
         self.assertAlmostEqual(allowed, 4.8)
