@@ -242,7 +242,8 @@ function governorText(g) {
   if (!g || !g.enabled) return "Credit governor off: the agent quota follows the fixed Layer 2b policy.";
   if (g.allowed_cores == null) return "Credit governor on: collecting samples…";
   const q = g.quota_pct == null ? "uncapped" : `${g.quota_pct}%`;
-  return `Credit governor ${g.observe ? "(observe mode, not applied)" : "on"}: the balance sustains ${g.allowed_cores} cores over ${g.horizon_min} min; other processes use ${g.others_cores}, so the agent quota is ${q}.`;
+  const reserve = g.reserve_pct ? ` above the ${g.reserve_pct}% reserve` : "";
+  return `Credit governor ${g.observe ? "(observe mode, not applied)" : "on"}: the balance${reserve} sustains ${g.allowed_cores} cores over ${g.horizon_min} min; other processes use ${g.others_cores}, so the agent quota is ${q}.`;
 }
 
 function renderCreditNote() {

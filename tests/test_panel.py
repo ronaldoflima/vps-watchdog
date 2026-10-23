@@ -476,12 +476,24 @@ class GovernorTests(Fixture):
         self.assertIsNone(quota)
 
     def test_low_balance_spreads_it_over_the_horizon(self):
-        allowed, others, quota = self.decide(20, 1.0)
+        allowed, others, quota = self.decide(20, 1.0, CREDIT_GOV_RESERVE_PCT="0")
         self.assertAlmostEqual(allowed, 4.8 + 6912 / 7200.0)
         self.assertEqual(quota, 450)
-        allowed, _o, quota = self.decide(20, 1.0, CREDIT_HORIZON_MIN="10")
+        allowed, _o, quota = self.decide(20, 1.0, CREDIT_HORIZON_MIN="10", CREDIT_GOV_RESERVE_PCT="0")
         self.assertAlmostEqual(allowed, 8.0)
         self.assertIsNone(quota)
+
+    def test_reserve_settles_balance_above_zero(self):
+        allowed, _o, _q = self.decide(20, 1.0, CREDIT_GOV_RESERVE_PCT="20")
+        self.assertAlmostEqual(allowed, 4.8)
+        allowed, _o, _q = self.decide(50, 1.0, CREDIT_GOV_RESERVE_PCT="20")
+        self.assertAlmostEqual(allowed, 4.8 + 0.3 * 34560 / 7200.0)
+        allowed, _o, _q = self.decide(15, 1.0, CREDIT_GOV_RESERVE_PCT="20")
+        self.assertLess(allowed, 4.8)
+        allowed, _o, _q = self.decide(0, 1.0, CREDIT_GOV_RESERVE_PCT="20")
+        self.assertAlmostEqual(allowed, 4.8 - 0.2 * 34560 / 7200.0)
+        allowed, _o, _q = self.decide(0, 1.0, CREDIT_GOV_RESERVE_PCT="20", CREDIT_HORIZON_MIN="10")
+        self.assertAlmostEqual(allowed, 2.4)
 
     def test_throttled_uses_provider_cap_and_floor(self):
         allowed, _o, quota = self.decide(0, 2.0, throttled=True, CREDIT_GOV_MIN_QUOTA_PCT="150")
@@ -494,7 +506,7 @@ class GovernorTests(Fixture):
                 self.p.sampler.history.append({"t": i, "busy": busy_pct, "agents": agents_pct})
 
     def test_tick_publishes_file_applies_quota_and_releases_when_disabled(self):
-        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "1"}})
+        self.p.save_config({"changes": {"CREDIT_GOVERNOR": "1", "CREDIT_GOV_RESERVE_PCT": "0"}})
         self.p.sampler.credits.balance = self.p.sampler.credits.cap * 0.2
         self.fill_history(50.0, 300.0)
         self.p.governor_tick()

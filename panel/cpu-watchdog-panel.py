@@ -111,6 +111,9 @@ SCHEMA = [
      "with PANEL_CREDIT_PROVIDER set."),
     ("Credit governor", "CREDIT_HORIZON_MIN", "int", "120",
      "Spend the balance over at least this long: allowed CPU = baseline + balance / horizon."),
+    ("Credit governor", "CREDIT_GOV_RESERVE_PCT", "int", "20",
+     "Balance to keep in reserve: allowed CPU = baseline + (balance - reserve) / horizon, so the "
+     "balance settles here instead of near zero, and below it usage is held under the baseline."),
     ("Credit governor", "CREDIT_GOV_MIN_QUOTA_PCT", "int", "100",
      "Agent quota never goes below this (100 = one core)."),
     ("Release", "RELEASE_SUSTAIN_CHECKS", "int", "3",
@@ -1443,10 +1446,12 @@ class Panel:
         c = self.sampler.credits
         horizon = max(1, int(vals.get("CREDIT_HORIZON_MIN") or 120))
         floor = int(vals.get("CREDIT_GOV_MIN_QUOTA_PCT") or 100)
+        reserve = c.cap * min(90, int(vals.get("CREDIT_GOV_RESERVE_PCT") or 20)) / 100.0
         if summary["throttled_est"]:
             allowed = c.limit
         else:
-            allowed = min(c.n, c.base + summary["balance_s"] / (horizon * 60.0))
+            allowed = c.base + (summary["balance_s"] - reserve) / (horizon * 60.0)
+            allowed = min(c.n, max(c.limit, allowed))
         others = max(0.0, total_cores - agent_cores)
         quota = int(round((allowed - others - self.GOV_MARGIN_CORES) * 100 / 25.0)) * 25
         quota = max(floor, quota)
@@ -1484,7 +1489,8 @@ class Panel:
         self.gov = {"enabled": True, "observe": observe, "allowed_cores": round(allowed, 2),
                     "others_cores": round(others, 2), "agents_cores": round(agent_cores, 2),
                     "quota_pct": quota, "balance_pct": summary["balance_pct"],
-                    "horizon_min": int(vals.get("CREDIT_HORIZON_MIN") or 120), "t": int(time.time())}
+                    "horizon_min": int(vals.get("CREDIT_HORIZON_MIN") or 120),
+                    "reserve_pct": int(vals.get("CREDIT_GOV_RESERVE_PCT") or 20), "t": int(time.time())}
         if observe:
             return
         if quota != self.gov_quota:

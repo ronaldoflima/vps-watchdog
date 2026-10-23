@@ -477,15 +477,19 @@ rising), fit the model to it:
 With `CREDIT_GOVERNOR=1` (Config tab, or *Credit governor → Turn on* in the
 overview, also temporarily) the panel turns the estimate into policy. Every
 30 s it computes how much CPU the balance can sustain,
-`baseline + balance / CREDIT_HORIZON_MIN`, capped at all vCPUs. It sets
+`baseline + (balance - reserve) / CREDIT_HORIZON_MIN`, between the provider's
+cap and all vCPUs, where the reserve is `CREDIT_GOV_RESERVE_PCT` of the
+capacity (default 20). The balance therefore settles at the reserve instead of
+near zero, a margin for estimation error; below it, usage is held under the
+baseline until the balance recovers. It sets
 the agent slice quota to that minus what other processes use, leaving the
 agents uncapped while the balance can sustain every vCPU and never going
 below `CREDIT_GOV_MIN_QUOTA_PCT`. It publishes the allowance in
 `STATE_DIR/credit-governor`, and the watchdog then triggers Layer 2 on that
 allowance instead of the fixed `AGG_CPU_THRESHOLD_PCT` and leaves the quota
 to the panel. The effect is to use the whole VM while credits last and to
-slow down gradually as they run out, approaching the baseline instead of
-hitting the provider's cap. If the panel stops, the file goes stale and the
+slow down gradually as they approach the reserve, settling at the baseline
+instead of hitting the provider's cap. If the panel stops, the file goes stale and the
 watchdog restores the fixed policy within 3 minutes. Manual quota changes
 are refused while the governor is on. The governor needs a credit provider:
 with `PANEL_CREDIT_PROVIDER=none` the panel refuses to turn it on and the loop
