@@ -13,6 +13,7 @@ const store = {
 let token = store.get("cwp-token") || "";
 let status = null;
 let samples = [];
+let creditSamples = [];
 let config = null;
 let cfgEdits = {};
 let tab = store.get("cwp-tab") || "overview";
@@ -138,14 +139,17 @@ async function refresh() {
   }
 }
 async function refreshHistory() {
-  try { samples = await api("/api/history"); renderCharts(); } catch { /* next poll retries */ }
+  try {
+    samples = await api("/api/history");
+    if (status?.credits) creditSamples = (await api("/api/credits")).map(([t, v]) => ({ t, credits: v }));
+    renderCharts();
+  } catch { /* next poll retries */ }
 }
 function start() {
   $("#login").hidden = true;
   $("#app").hidden = false;
   setTab(tab);
-  refresh();
-  refreshHistory();
+  refresh().then(refreshHistory);
   clearInterval(polling);
   polling = setInterval(() => { refresh(); }, 3000);
   setInterval(refreshHistory, 15000);
@@ -202,6 +206,32 @@ function tile({ label, value, sub, lvl, meter }) {
   return `<div class="tile"><div class="label">${esc(label)}</div><div class="value">${value}</div>${sub ? `<div class="sub">${sub}</div>` : ""}${st}${m}</div>`;
 }
 
+const fmtMin = (m) => (m == null ? "–" : m >= 60 ? `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min` : `${m} min`);
+
+function creditTile(c) {
+  if (!c) return "";
+  let sub;
+  if (c.throttled_est) sub = `provider cap ~${c.throttle_cores} cores until ${c.recover_pct}%`;
+  else if (c.empty_in_min != null) sub = `draining · empty in ${fmtMin(c.empty_in_min)}`;
+  else if (c.full_in_min != null) sub = `refilling · full in ${fmtMin(c.full_in_min)}`;
+  else sub = "full";
+  const lvl = c.throttled_est || c.balance_pct < 20 ? "critical" : c.balance_pct < 40 ? "warning" : "good";
+  return tile({ label: "CPU credits (est.)", value: fmtPct(c.balance_pct), sub: `${sub}<br>baseline ${c.baseline_cores} cores · using ${c.use_cores ?? "–"}`, lvl, meter: c.balance_pct });
+}
+
+function renderCreditNote() {
+  const c = status?.credits;
+  const el = $("#credits-note");
+  if (!el) return;
+  if (!c) { el.textContent = ""; return; }
+  const parts = [
+    `Spending more than ${c.baseline_cores} cores drains the balance; less refills it.`,
+    c.burst_full_min != null ? `With the current balance all ${c.vcpus} vCPUs can run flat out for ${fmtMin(c.burst_full_min)}.` : "",
+    `Source: ${c.backfilling ? "replaying atop history…" : c.source}. Hostinger does not publish the real balance; this follows its documented model.`,
+  ];
+  el.textContent = parts.filter(Boolean).join(" ");
+}
+
 function renderOverview() {
   const h = status.host, sl = status.slice, w = status.watchdog, th = w.thresholds;
   const aggThr = Number(th.AGG_CPU_THRESHOLD_PCT || 55);
@@ -212,6 +242,7 @@ function renderOverview() {
   const tiles = [
     tile({ label: "Host CPU busy", value: fmtPct(h.busy_pct), sub: `Layer 2 trigger at ${aggThr}% · counter ${w.agg_count}/${th.AGG_SUSTAIN_CHECKS || 5}`, lvl: level(h.busy_pct, aggThr - 10, aggThr), meter: h.busy_pct }),
     tile({ label: "Steal", value: fmtPct(h.steal_pct), sub: "CPU taken by the hypervisor", lvl: level(h.steal_pct, 10, 25) }),
+    creditTile(status.credits),
     tile({ label: "Load average", value: esc((h.load || [])[0] || "–"), sub: `${esc((h.load || []).slice(1).join(" · "))} · ${h.nproc} CPUs`, lvl: level(Number((h.load || [])[0]) / h.nproc * 100, 100, 200) }),
     tile({ label: "Agent slice", value: slUse == null ? "–" : fmtPct(slUse), sub: quota != null ? `quota ${quota}% · ${w.agent_quota_state}` : `uncapped · config ${th.AGENT_CPU_QUOTA_PCT}%`, lvl: quota != null ? level(slUse / quota * 100, 85, 97) : null, meter: quota != null ? slUse / quota * 100 : null }),
     tile({ label: "Agent stall (PSI full)", value: fmtPct(slPsiFull), sub: "time all agents waited for CPU", lvl: level(slPsiFull, 15, 35) }),
@@ -237,6 +268,9 @@ const CHARTS = {
   agents: { el: "#chart-agents", legend: "#legend-agents", series: [
     { key: "agents", label: "Agent usage", color: "--series-1" },
   ], refKey: { key: "quota", label: "Quota" } },
+  credits: { el: "#chart-credits", legend: "#legend-credits", max: 100, data: () => creditSamples, series: [
+    { key: "credits", label: "Balance", color: "--series-3" },
+  ], ref: () => ({ value: Number(status?.credits?.recover_pct || 20), label: "Limit lifts" }) },
   mem: { el: "#chart-mem", legend: "#legend-mem", max: 100, series: [
     { key: "mem_avail", label: "RAM available", color: "--series-1" },
     { key: "swap_used", label: "Swap used", color: "--series-2" },
@@ -248,13 +282,14 @@ function cssVar(name) { return getComputedStyle(document.documentElement).getPro
 function renderCharts() {
   if (tab !== "overview") return;
   for (const [, c] of Object.entries(CHARTS)) drawChart(c);
+  renderCreditNote();
 }
 
 function drawChart(c) {
   const el = $(c.el);
   const W = el.clientWidth || 400, H = el.clientHeight || 170;
   const pad = { l: 36, r: 10, t: 8, b: 20 };
-  const data = samples;
+  const data = c.data ? c.data() : samples;
   const legend = c.series.map((s) => `<span><span class="sw" style="background:var(${s.color})"></span>${esc(s.label)}</span>`);
   if (c.ref) legend.push(`<span><span class="sw dash"></span>${esc(c.ref().label)}</span>`);
   if (c.refKey) legend.push(`<span><span class="sw dash"></span>${esc(c.refKey.label)}</span>`);
@@ -281,7 +316,8 @@ function drawChart(c) {
     svg += `<text class="axis-label" x="${pad.l - 6}" y="${yy + 3}" text-anchor="end">${Math.round(v)}%</text>`;
   }
   const mins = Math.round((t1 - t0) / 60);
-  svg += `<text class="axis-label" x="${pad.l}" y="${H - 4}">-${mins} min</text><text class="axis-label" x="${W - pad.r}" y="${H - 4}" text-anchor="end">now</text>`;
+  const span = mins >= 120 ? `-${Math.round(mins / 60)} h` : `-${mins} min`;
+  svg += `<text class="axis-label" x="${pad.l}" y="${H - 4}">${span}</text><text class="axis-label" x="${W - pad.r}" y="${H - 4}" text-anchor="end">now</text>`;
   if (c.ref) {
     const r = c.ref();
     svg += `<line class="ref" x1="${pad.l}" x2="${W - pad.r}" y1="${y(r.value)}" y2="${y(r.value)}"/>`;

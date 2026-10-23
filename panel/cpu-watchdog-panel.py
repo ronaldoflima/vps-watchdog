@@ -46,6 +46,13 @@ PANEL_DEFAULTS = {
     "PANEL_ALLOW_REBOOT": "1",
     "PANEL_SAMPLE_SEC": "3",
     "PANEL_HISTORY_MIN": "60",
+    "PANEL_CREDIT_MODEL": "1",
+    "PANEL_CREDIT_VCPUS": "",
+    "PANEL_CREDIT_BASELINE_PCT": "60",
+    "PANEL_CREDIT_THROTTLE_PCT": "30",
+    "PANEL_CREDIT_BURST_HOURS": "3",
+    "PANEL_CREDIT_RECOVER_PCT": "20",
+    "PANEL_ATOP_DIR": "/var/log/atop",
     "WATCHDOG_CONF": "/etc/cpu-watchdog.conf",
     "WATCHDOG_CTL": "/usr/local/bin/cpu-watchdog-ctl",
     "EARLYOOM_DEFAULT": "/etc/default/earlyoom",
@@ -353,6 +360,173 @@ def validate_value(key, value, nproc):
     return bash_quote(value)
 
 
+def boot_id():
+    return read_file(os.path.join(PROC, "sys", "kernel", "random", "boot_id")).strip()
+
+
+def busy_seconds(cpu_fields, hz):
+    """Non-idle CPU time (user+nice+system+irq+softirq) in core-seconds; steal excluded."""
+    f = (cpu_fields + [0] * 8)[:8]
+    return (f[0] + f[1] + f[2] + f[5] + f[6]) / hz
+
+
+class CreditModel:
+    """Estimate of a provider CPU-credit balance (token bucket, Hostinger's model by default).
+
+    One credit is one vCPU-second at 100%. The VM earns BASELINE% x vCPUs credits per
+    second and spends the busy core-seconds it actually ran. Capacity is
+    BURST_HOURS x 3600 x (vCPUs - baseline cores), i.e. the time a full balance lasts at
+    100% on every vCPU. At zero the provider caps the VM at THROTTLE% of its vCPUs and
+    earns nothing while capped, until the balance is back to RECOVER% of capacity.
+    The provider does not expose the real balance, so this is an estimate."""
+
+    def __init__(self, conf, nproc, path):
+        self.n = float(conf["PANEL_CREDIT_VCPUS"] or nproc)
+        self.base = self.n * float(conf["PANEL_CREDIT_BASELINE_PCT"]) / 100
+        self.limit = self.n * float(conf["PANEL_CREDIT_THROTTLE_PCT"]) / 100
+        self.cap = float(conf["PANEL_CREDIT_BURST_HOURS"]) * 3600 * max(0.01, self.n - self.base)
+        self.recover = float(conf["PANEL_CREDIT_RECOVER_PCT"]) / 100
+        self.path = path
+        self.lock = threading.Lock()
+        self.balance = self.cap
+        self.throttled = False
+        self.source = "assumed full (no history yet)"
+        self.last = None
+        self.history = collections.deque(maxlen=24 * 60)
+        self.recent = collections.deque(maxlen=200)
+        self.pending = []
+        self.backfilling = False
+        self.last_saved = 0
+
+    def step(self, consumed, dt):
+        earn = 0.0 if self.throttled else self.base * dt
+        self.balance = min(self.cap, max(0.0, self.balance + earn - consumed))
+        if self.balance <= 0:
+            self.throttled = True
+        elif self.throttled and self.balance >= self.recover * self.cap:
+            self.throttled = False
+
+    def load(self):
+        try:
+            data = json.loads(read_file(self.path, "{}"))
+        except ValueError:
+            return False
+        if not data.get("balance_s") and data.get("balance_s") != 0:
+            return False
+        with self.lock:
+            self.balance = min(self.cap, float(data["balance_s"]))
+            self.throttled = bool(data.get("throttled"))
+            self.source = data.get("source", "saved state")
+            self.history.extend(tuple(x) for x in data.get("history", []))
+            last = data.get("last")
+            if last and last.get("boot_id") == boot_id():
+                self.last = (float(last["busy_s"]), float(last["t"]))
+        return True
+
+    def save(self):
+        with self.lock:
+            data = {"balance_s": round(self.balance, 1), "throttled": self.throttled, "source": self.source,
+                    "history": list(self.history),
+                    "last": {"busy_s": self.last[0], "t": self.last[1], "boot_id": boot_id()} if self.last else None}
+        try:
+            atomic_write(self.path, json.dumps(data), 0o600)
+        except OSError:
+            pass
+
+    def update(self, busy_s, t):
+        with self.lock:
+            if self.last and busy_s >= self.last[0] and t > self.last[1]:
+                consumed, dt = busy_s - self.last[0], t - self.last[1]
+                if self.backfilling:
+                    self.pending.append((consumed, dt))
+                self.step(consumed, dt)
+                self.recent.append((t, self.balance, consumed / dt))
+            self.last = (busy_s, t)
+            if not self.history or t - self.history[-1][0] >= 60:
+                self.history.append((int(t), round(self.balance / self.cap * 100, 2)))
+        if t - self.last_saved >= 60:
+            self.last_saved = t
+            self.save()
+
+    def backfill(self, samples, source):
+        """Replay (dt, busy cores) samples from a full balance, then the live steps seen meanwhile."""
+        with self.lock:
+            self.balance, self.throttled = self.cap, False
+            hist = []
+            for t, dt, cores in samples:
+                self.step(cores * dt, dt)
+                hist.append((int(t), round(self.balance / self.cap * 100, 2)))
+            for consumed, dt in self.pending:
+                self.step(consumed, dt)
+            self.pending = []
+            self.backfilling = False
+            self.source = source
+            live = list(self.history)
+            self.history.clear()
+            self.history.extend(hist[-(24 * 6):] + [h for h in live if not hist or h[0] > hist[-1][0]])
+        self.save()
+
+    def summary(self):
+        with self.lock:
+            bal, cap, thr = self.balance, self.cap, self.throttled
+            recent = list(self.recent)
+            hist = list(self.history)
+            source = self.source
+        use = None
+        rate = None
+        window = [r for r in recent if r[0] >= time.time() - 300]
+        if len(window) >= 2:
+            span = window[-1][0] - window[0][0]
+            if span > 0:
+                rate = (window[-1][1] - window[0][1]) / span
+                use = sum(r[2] for r in window) / len(window)
+        out = {
+            "balance_pct": round(bal / cap * 100, 1), "balance_s": round(bal), "capacity_s": round(cap),
+            "vcpus": self.n, "baseline_cores": round(self.base, 2), "throttle_cores": round(self.limit, 2),
+            "throttled_est": thr, "recover_pct": self.recover * 100, "source": source,
+            "use_cores": round(use, 2) if use is not None else None,
+            "net_per_min": round(rate * 60) if rate is not None else None,
+            "burst_full_min": round(bal / (self.n - self.base) / 60) if self.n > self.base else None,
+            "history": hist,
+        }
+        if use is not None and use > self.base:
+            out["empty_in_min"] = round(bal / (use - self.base) / 60)
+        elif use is not None and bal < cap:
+            out["full_in_min"] = round((cap - bal) / max(0.01, self.base - use) / 60)
+        return out
+
+
+def atop_samples(atop_dir, hours, hz_cores=100.0):
+    """(epoch, interval seconds, busy cores) from atop raw logs of the last HOURS hours."""
+    since = time.time() - hours * 3600
+    days = sorted({time.strftime("%Y%m%d", time.localtime(x)) for x in (since, since + 86400, time.time())})
+    samples = []
+    for day in days:
+        path = os.path.join(atop_dir, "atop_" + day)
+        if not os.path.exists(path):
+            continue
+        rc, out = run(["nice", "-n", "19", "atopsar", "-c", "-r", path], timeout=900)
+        if rc != 0:
+            continue
+        prev = None
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) >= 11 and f[1] == "all" and re.fullmatch(r"\d\d:\d\d:\d\d", f[0]):
+                t = time.mktime(time.strptime(day + " " + f[0], "%Y%m%d %H:%M:%S"))
+                if prev is not None and 0 < t - prev <= 3600 and t >= since:
+                    try:
+                        cores = sum(float(x) for x in f[2:7]) / hz_cores
+                    except ValueError:
+                        cores = None
+                    if cores is not None:
+                        samples.append((t, t - prev, cores))
+                prev = t
+            elif "restart" in line.lower():
+                prev = None
+    samples.sort()
+    return samples
+
+
 class Sampler(threading.Thread):
     """Samples /proc and the agent slice periodically; keeps a short history."""
 
@@ -377,6 +551,23 @@ class Sampler(threading.Thread):
         self.hz = os.sysconf("SC_CLK_TCK")
         self.nproc = os.cpu_count() or 1
         self.boot = self._boot_time()
+        self.credits = None
+        if panel.conf["PANEL_CREDIT_MODEL"] == "1":
+            self.credits = CreditModel(panel.conf, self.nproc,
+                                       os.path.join(panel.state_dir(), "panel-credits.json"))
+            if not self.credits.load():
+                self.credits.backfilling = True
+                threading.Thread(target=self.backfill_credits, daemon=True).start()
+
+    def backfill_credits(self):
+        samples = atop_samples(self.panel.conf["PANEL_ATOP_DIR"], 48)
+        if samples:
+            hours = (samples[-1][0] - samples[0][0]) / 3600
+            self.credits.backfill(samples, "replayed %.0f h of atop history, then live" % hours)
+        else:
+            with self.credits.lock:
+                self.credits.backfilling = False
+                self.credits.pending = []
 
     def _boot_time(self):
         for line in read_file(os.path.join(PROC, "stat")).splitlines():
@@ -522,6 +713,9 @@ class Sampler(threading.Thread):
 
         with self.lock:
             self.prev_cpu, self.prev_procs, self.prev_slice, self.prev_t = cpu, procs, sl, t
+        if cpu and self.credits:
+            self.credits.update(busy_seconds(cpu, self.hz), t)
+        with self.lock:
             self.host = host
             self.slice = sl
             self.procs = rows
@@ -732,7 +926,21 @@ class Panel:
             "units": self.units(),
             "allow_reboot": self.conf["PANEL_ALLOW_REBOOT"] == "1",
             "overrides": [{k: v for k, v in o.items() if k != "data"} for o in self.load_overrides()],
+            "credits": self.credit_summary(),
         }
+
+    def credit_summary(self):
+        c = self.sampler.credits
+        if not c:
+            return None
+        out = c.summary()
+        out.pop("history", None)
+        out["backfilling"] = c.backfilling
+        return out
+
+    def credit_history(self):
+        c = self.sampler.credits
+        return c.summary()["history"] if c else []
 
     def history(self):
         with self.sampler.lock:
@@ -1230,6 +1438,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, self.panel.history())
             if url.path == "/api/config":
                 return self.send(200, self.panel.config())
+            if url.path == "/api/credits":
+                return self.send(200, self.panel.credit_history())
             if url.path == "/api/tmux":
                 return self.send(200, {"sessions": self.panel.tmux_targets()})
             if url.path == "/api/log":

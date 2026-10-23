@@ -45,7 +45,7 @@ class Fixture(unittest.TestCase):
         self.panel_conf = os.path.join(self.tmp, "panel.conf")
         with open(self.panel_conf, "w") as f:
             f.write('PANEL_TOKEN_FILE=%s/token\nWATCHDOG_CONF=%s\nPANEL_UNITS="a.service bad;unit"\n'
-                    'EARLYOOM_DEFAULT=%s/earlyoom\nWATCHDOG_CTL=/bin/false\n' % (self.tmp, self.conf, self.tmp))
+                    'EARLYOOM_DEFAULT=%s/earlyoom\nWATCHDOG_CTL=/bin/false\nPANEL_ATOP_DIR=%s/no-atop\n' % (self.tmp, self.conf, self.tmp, self.tmp))
         self.m = load_module({"CPU_WATCHDOG_PANEL_CONF": self.panel_conf})
         self.p = self.m.Panel()
 
@@ -147,6 +147,84 @@ class OverrideTests(Fixture):
     def test_secret_cannot_be_temporary(self):
         with self.assertRaises(ValueError):
             self.p.save_config({"changes": {"TELEGRAM_BOT_TOKEN": "x"}, "duration_min": 5})
+
+
+class CreditTests(Fixture):
+    def model(self, vcpus):
+        conf = dict(self.m.PANEL_DEFAULTS, PANEL_CREDIT_VCPUS=str(vcpus))
+        return self.m.CreditModel(conf, vcpus, os.path.join(self.tmp, "credits.json"))
+
+    def test_hostinger_documented_numbers(self):
+        k1, k8 = self.model(1), self.model(8)
+        self.assertAlmostEqual(k1.cap, 4320)
+        self.assertAlmostEqual(k8.cap, 34560)
+        k1.balance = 1000
+        for pct, delta in ((10, 30), (60, 0), (100, -24)):
+            before = k1.balance
+            k1.step(pct / 100 * 60, 60)
+            self.assertAlmostEqual(k1.balance - before, delta)
+
+    def test_full_balance_lasts_three_hours_at_full_load(self):
+        k8 = self.model(8)
+        for _ in range(3 * 60 - 1):
+            k8.step(8 * 60, 60)
+        self.assertFalse(k8.throttled)
+        k8.step(8 * 60, 60)
+        self.assertTrue(k8.throttled)
+        self.assertEqual(k8.balance, 0)
+
+    def test_no_earning_while_capped_until_recover_threshold(self):
+        k8 = self.model(8)
+        k8.balance, k8.throttled = 0, True
+        k8.step(0, 600)
+        self.assertEqual(k8.balance, 0)
+        self.assertTrue(k8.throttled)
+
+    def test_live_updates_save_and_resume_after_restart(self):
+        k = self.model(8)
+        k.update(1000.0, 1000.0)
+        k.update(1000.0 + 8 * 600, 1600.0)
+        expected = k.cap - (8 - 4.8) * 600
+        self.assertAlmostEqual(k.balance, expected)
+        k.save()
+        k2 = self.model(8)
+        self.assertTrue(k2.load())
+        self.assertAlmostEqual(k2.balance, round(expected, 1), places=0)
+        k2.update(1000.0 + 8 * 600, 2200.0)
+        self.assertAlmostEqual(k2.balance, min(k2.cap, round(expected, 1) + 4.8 * 600), places=0)
+
+    def test_backfill_replays_atop_then_pending_live_steps(self):
+        bindir = os.path.join(self.tmp, "bin")
+        atop = os.path.join(self.tmp, "atop")
+        os.makedirs(bindir)
+        os.makedirs(atop)
+        day = time.strftime("%Y%m%d")
+        open(os.path.join(atop, "atop_" + day), "w").close()
+        now = time.localtime()
+        base = time.mktime(time.strptime(day, "%Y%m%d"))
+        lines = ["00:00:00  cpu  %usr %nice %sys %irq %softirq  %steal %guest  %wait %idle  _cpu_"]
+        t = base
+        while t + 600 < time.mktime(now):
+            t += 600
+            lines.append("%s  all   700     0  100    0        0      0      0      0     0" % time.strftime("%H:%M:%S", time.localtime(t)))
+            lines.append("            0    90     0   10    0        0       0      0      0     0")
+        with open(os.path.join(bindir, "atopsar"), "w") as f:
+            f.write("#!/bin/sh\ncat <<'X'\n%s\nX\n" % "\n".join(lines))
+        os.chmod(os.path.join(bindir, "atopsar"), 0o755)
+        os.environ["PATH"] = bindir + os.pathsep + os.environ["PATH"]
+        samples = self.m.atop_samples(atop, 48)
+        if not samples:
+            self.skipTest("too early in the day for a sample")
+        self.assertTrue(all(abs(c - 8.0) < 1e-9 and dt == 600 for _t, dt, c in samples))
+        k = self.model(8)
+        k.backfilling = True
+        k.pending = [(0.0, 600.0)]
+        k.backfill(samples, "test")
+        drained = max(0.0, k.cap - 3.2 * 600 * len(samples))
+        self.assertLessEqual(k.balance, k.cap)
+        if drained > 0:
+            self.assertAlmostEqual(k.balance, min(k.cap, drained + 4.8 * 600))
+        self.assertFalse(k.backfilling)
 
 
 class TmuxTests(Fixture):
