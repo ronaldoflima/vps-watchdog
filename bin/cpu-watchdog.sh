@@ -676,6 +676,33 @@ done <<<"$PS_SNAPSHOT"
 
 mv "${COUNTS_FILE}.new" "$COUNTS_FILE"
 
+### Credit governor (published by cpu-watchdog-panel) ###
+#
+# While the panel's credit governor runs, it owns the agent slice quota and
+# publishes, every 30 s, how much CPU the estimated provider credit balance
+# can sustain ("epoch<TAB>allowed%" with 100 = one core). Layer 2 then
+# triggers on that instead of AGG_CPU_THRESHOLD_PCT and Layer 2b leaves the
+# quota alone. A stale file (panel stopped) restores the fixed policy and
+# removes the quota the governor left behind.
+
+GOVERNOR_FILE="$STATE_DIR/credit-governor"
+GOV_ACTIVE=0
+GOV_STALE=0
+AGG_THRESHOLD_DESC="${AGG_CPU_THRESHOLD_PCT}% of ${NPROC} CPUs"
+if [ -f "$GOVERNOR_FILE" ]; then
+    gov_epoch=""
+    gov_allowed=""
+    IFS=$'\t' read -r gov_epoch gov_allowed _ <"$GOVERNOR_FILE" || true
+    if [[ "$gov_epoch" =~ ^[0-9]+$ && "$gov_allowed" =~ ^[0-9]+$ ]] &&
+       [ $(( NOW - gov_epoch )) -le "${GOVERNOR_STALE_SEC:-180}" ]; then
+        GOV_ACTIVE=1
+        AGG_THRESHOLD_ABS="$gov_allowed"
+        AGG_THRESHOLD_DESC="credit governor"
+    else
+        GOV_STALE=1
+    fi
+fi
+
 ### Layer 2: aggregate host usage ###
 
 old_agg_count=0
@@ -700,7 +727,7 @@ if [ "$new_agg_count" -ge "$AGG_SUSTAIN_CHECKS" ]; then
 
     MAX_THROTTLES="${AGG_MAX_THROTTLES:-${AGG_TOP_N:-3}}"
 
-    log "AGG_HIGH aggregate usage ${AGG_USAGE}% (threshold ${AGG_THRESHOLD_ABS}% = ${AGG_CPU_THRESHOLD_PCT}% of ${NPROC} CPUs) sustained >=${AGG_SUSTAIN_CHECKS}min -> throttling up to ${MAX_THROTTLES} processes"
+    log "AGG_HIGH aggregate usage ${AGG_USAGE}% (threshold ${AGG_THRESHOLD_ABS}% = ${AGG_THRESHOLD_DESC}) sustained >=${AGG_SUSTAIN_CHECKS}min -> throttling up to ${MAX_THROTTLES} processes"
 
     picked=0
 
@@ -824,7 +851,20 @@ if [ -r "$AGENT_QUOTA_FILE" ]; then
 fi
 [[ "${aq_idle:-}" =~ ^[0-9]+$ ]] || aq_idle=0
 
-if agent_quota_enabled; then
+if [ "$GOV_STALE" -eq 1 ]; then
+    if [ "$MODE" = active ] && [ "$aq_state" != on ] && agent_set_quota ""; then
+        log "CREDIT_GOVERNOR stale (panel stopped?) -> fixed policy restored, governor cap removed from $AGENT_SLICE"
+    fi
+    [ "$MODE" = observe ] || rm -f "$GOVERNOR_FILE"
+fi
+
+if [ "$GOV_ACTIVE" -eq 1 ]; then
+    if [ -n "${AGENT_COMM:-}" ] && [ "$MODE" != observe ]; then
+        agent_adopt
+    fi
+    # The governor owns the quota now; forget a cap this script applied.
+    [ "$aq_state" != on ] || rm -f "$AGENT_QUOTA_FILE"
+elif agent_quota_enabled; then
     [ "$MODE" = observe ] || agent_adopt
 
     if [ "$aq_state" != on ]; then
