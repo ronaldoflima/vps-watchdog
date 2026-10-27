@@ -1119,6 +1119,8 @@ class Panel:
         self.sampler = Sampler(self)
         self.audit_lock = threading.Lock()
         self.override_lock = threading.Lock()
+        self.services_lock = threading.RLock()
+        self.services = self.load_services()
         self.gov = {"enabled": False}
         self.gov_quota = "unset"
 
@@ -1152,7 +1154,108 @@ class Panel:
                 sys.stderr.write(line)
 
     def units(self):
-        return [u for u in self.conf["PANEL_UNITS"].split() if UNIT_RE.match(u)]
+        # systemctl treats suffixless names as services; use one identity in
+        # both the followed list and the discovery catalog.
+        return list(dict.fromkeys(u if "." in u.rsplit("/", 1)[-1] else u + ".service"
+                                  for u in self.conf["PANEL_UNITS"].split() if UNIT_RE.fullmatch(u)))
+
+    def load_services(self):
+        try:
+            data = json.loads(read_file(os.path.join(self.state_dir(), "panel-services.json"), "{}"))
+            if not isinstance(data, dict) or not isinstance(data.get("services", {}), dict):
+                raise ValueError("invalid service catalog")
+            if not isinstance(data.get("favorites", []), list):
+                raise ValueError("invalid service favorites")
+            return {"services": data.get("services", {}), "favorites": data.get("favorites", []),
+                    "last_scan": data.get("last_scan"), "error": ""}
+        except (ValueError, TypeError):
+            return {"services": {}, "favorites": [], "last_scan": None, "error": ""}
+
+    def write_services(self, data):
+        os.makedirs(self.state_dir(), exist_ok=True)
+        atomic_write(os.path.join(self.state_dir(), "panel-services.json"), json.dumps(data), 0o600)
+        self.services = data
+
+    def service_catalog(self):
+        with self.services_lock:
+            return json.loads(json.dumps(self.services))
+
+    def discover_services(self):
+        """Catalog locally installed services, excluding distribution unit fragments.
+
+        Read FragmentPath through systemd so vendor units with local overrides
+        remain excluded. Keep old entries when a unit disappears or a scan fails.
+        """
+        try:
+            names = set()
+            for verb in ("list-unit-files", "list-units"):
+                rc, out = run(["systemctl", verb, "--type=service", "--all", "--no-legend", "--no-pager", "--plain"])
+                if rc:
+                    raise ValueError(out.strip() or "systemd discovery failed")
+                for line in out.splitlines():
+                    name = line.split()[0] if line.split() else ""
+                    if UNIT_RE.fullmatch(name) and name.endswith(".service") and not name.endswith("@.service"):
+                        names.add(name)
+            found = {}
+            ordered = sorted(names)
+            for start in range(0, len(ordered), 100):
+                batch = ordered[start:start + 100]
+                props = systemctl_show_many(batch, ["FragmentPath", "Description"])
+                if any(name not in props for name in batch):
+                    raise ValueError("Could not inspect all services; keeping the previous catalog.")
+                for name, values in props.items():
+                    path = os.path.realpath(values.get("FragmentPath") or "/")
+                    if path.startswith(("/etc/systemd/system/", "/usr/local/lib/systemd/system/")):
+                        found[name] = {"description": values.get("Description", ""), "path": path}
+            now = int(time.time())
+            with self.services_lock:
+                data = self.service_catalog()
+                for entry in data["services"].values():
+                    entry["available"] = False
+                for name, values in found.items():
+                    previous = data["services"].get(name, {})
+                    data["services"][name] = {**values, "available": True,
+                                              "first_seen": previous.get("first_seen", now), "last_seen": now}
+                data.update(last_scan=now, error="")
+                self.write_services(data)
+        except Exception as exc:
+            with self.services_lock:
+                self.services["error"] = str(exc)
+
+    def service_discovery_loop(self):
+        while True:
+            self.discover_services()
+            time.sleep(300)
+
+    def update_service(self, body):
+        unit, op = body.get("unit"), body.get("op")
+        if not isinstance(unit, str) or not UNIT_RE.fullmatch(unit):
+            raise ValueError("invalid unit name")
+        with self.services_lock:
+            tracked = self.units()
+            data = self.service_catalog()
+            if unit not in tracked and unit not in data["services"]:
+                raise ValueError("unknown service")
+            if op == "follow":
+                if unit not in tracked:
+                    self.save_units({"units": " ".join(tracked + [unit])})
+            elif op == "remove":
+                # Keep legacy/manual entries selectable after unfollowing too.
+                data["services"].setdefault(unit, {"description": "Previously followed service",
+                                                   "available": False})
+                self.write_services(data)
+                self.save_units({"units": " ".join(u for u in tracked if u != unit)})
+            elif op in ("favorite", "unfavorite"):
+                if unit not in tracked:
+                    raise ValueError("follow the service before favoriting it")
+                data["favorites"] = [u for u in data["favorites"] if u != unit]
+                if op == "favorite":
+                    data["favorites"].append(unit)
+                self.write_services(data)
+            else:
+                raise ValueError("invalid service operation")
+            self.audit("service preference %s %s" % (op, unit))
+        return {"ok": True, "message": "Service preferences updated."}
 
     def collect_slow(self):
         props = ["ActiveState", "SubState", "MainPID", "MemoryCurrent", "CPUUsageNSec",
@@ -1237,6 +1340,7 @@ class Panel:
             "agent_count": len(agents),
             "top_comm": counts.most_common(8),
             "units": self.units(),
+            "service_catalog": self.service_catalog(),
             "allow_reboot": self.conf["PANEL_ALLOW_REBOOT"] == "1",
             "overrides": [{k: v for k, v in o.items() if k != "data"} for o in self.load_overrides()],
             "swap": self.swap_status(),
@@ -2043,6 +2147,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/credits/config": self.panel.save_credit_config,
             "/api/earlyoom": self.panel.save_earlyoom,
             "/api/units": self.panel.save_units,
+            "/api/services": self.panel.update_service,
             "/api/action": self.panel.action,
             "/api/override": self.panel.override_action,
         }
@@ -2065,6 +2170,7 @@ def main():
     panel.sampler.start()
     threading.Thread(target=panel.reverter, daemon=True).start()
     threading.Thread(target=panel.governor_loop, daemon=True).start()
+    threading.Thread(target=panel.service_discovery_loop, daemon=True).start()
     Handler.panel = panel
     bind, port = panel.conf["PANEL_BIND"], int(panel.conf["PANEL_PORT"])
     family = socket.AF_INET6 if ":" in bind else socket.AF_INET

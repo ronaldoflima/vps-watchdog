@@ -204,12 +204,16 @@
 
     <section data-panel="services" hidden>
       <div class="card">
-        <h3>Managed units</h3>
+        <h3>Followed services</h3>
+        <p class="muted small">Star a service to keep it at the top. Removing it here only stops following it.</p>
         <table id="units"></table>
-        <div class="row">
-          <input id="units-edit" class="grow" placeholder="space-separated units; user units as user/name.service">
-          <button id="units-save">Save list</button>
-        </div>
+      </div>
+      <div class="card">
+        <h3>Discovered services</h3>
+        <p class="muted small">Local systemd services are discovered every 5 minutes, even with this page closed. Distribution services are excluded. Previously discovered services stay in this catalog.</p>
+        <p id="services-scan" class="muted small"></p>
+        <input id="services-search" type="search" placeholder="Search services" aria-label="Search discovered services">
+        <table id="services-catalog"></table>
       </div>
       <div class="grid2">
         <div class="card">

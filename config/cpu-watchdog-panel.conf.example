@@ -13,6 +13,8 @@ PANEL_TOKEN_FILE=/etc/cpu-watchdog-panel.token
 PANEL_ALLOWED_HOSTS=""
 
 # systemd units the panel may start/stop/restart. Also editable from the panel.
+# Services discovered every 5 minutes can be followed/unfollowed from Services.
+# Catalog and favorites persist in STATE_DIR/panel-services.json.
 # Prefix a user unit with its owner: "alice/sync.service" runs
 # systemctl --user -M alice@ (the user needs lingering: loginctl enable-linger alice).
 PANEL_UNITS="cpu-watchdog.timer earlyoom cpu-watchdog-panel"

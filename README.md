@@ -397,7 +397,19 @@ browser:
 - **Config:** every `/etc/cpu-watchdog.conf` setting grouped by layer, validated
   before writing (`bash -n`, types, regexes), with a one-step backup restore;
   earlyoom arguments (rolled back if earlyoom fails to restart).
-- **Services:** start/stop/restart for the units in `PANEL_UNITS`, swap
+- **Services:** follow/unfollow services from a persistent catalog and star
+  favorites to keep them at the top; start/stop/restart followed units. Discovery
+  runs at panel startup and every 5 minutes, even with the browser closed. It
+  catalogs services whose resolved systemd fragment is in `/etc/systemd/system`
+  or `/usr/local/lib/systemd/system`, excluding distribution units (including
+  those with local drop-ins or enablement symlinks). Installed services and
+  loaded template instances are included; bare templates are excluded.
+  Previously detected services stay selectable when no longer detected.
+  Existing `PANEL_UNITS` entries (including `user/unit` specs) are preserved;
+  removing a service from the panel does not stop or disable it. Preferences and
+  the catalog are saved in `STATE_DIR/panel-services.json`; the followed list
+  remains in `PANEL_UNITS`. Discovery covers the host system manager; existing
+  user-unit entries remain manageable. Also includes swap
   management (add or remove `swapfileN` files on the root filesystem, persisted
   in `/etc/fstab`; set `vm.swappiness`, persisted in
   `/etc/sysctl.d/99-zz-cpu-watchdog-panel.conf`; flush swap back to RAM) and

@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -56,6 +57,75 @@ class Fixture(unittest.TestCase):
         out = subprocess.run(["bash", "-c", 'source "$1"; printf %s "${!2}"', "_", self.conf, key],
                              capture_output=True, text=True, check=True)
         return out.stdout
+
+
+class ServiceTests(Fixture):
+    def test_suffixless_followed_names_match_discovered_identity(self):
+        self.p.conf["PANEL_UNITS"] = "app app.service alice/worker cpu-watchdog.timer"
+        self.assertEqual(self.p.units(), ["app.service", "alice/worker.service", "cpu-watchdog.timer"])
+
+    def test_catalog_filters_vendor_units_and_keeps_disappeared_services(self):
+        props = {
+            "app.service": {"FragmentPath": "/etc/systemd/system/app.service", "Description": "App"},
+            "sshd.service": {"FragmentPath": "/usr/lib/systemd/system/sshd.service"},
+            "other.service": {"FragmentPath": "/usr/local/lib/systemd/system/other.service"},
+        }
+        with patch.object(self.m, "run", return_value=(0, "app.service enabled\nsshd.service enabled\nother.service disabled")), patch.object(self.m, "systemctl_show_many", return_value=props):
+            self.p.discover_services()
+        self.assertEqual(set(self.p.service_catalog()["services"]), {"app.service", "other.service"})
+        with patch.object(self.m, "run", return_value=(0, "")):
+            self.p.discover_services()
+        self.assertIn("app.service", self.m.Panel().service_catalog()["services"])
+        self.assertFalse(self.p.service_catalog()["services"]["app.service"]["available"])
+
+    def test_follow_remove_favorite_and_restart(self):
+        with patch.object(self.m, "run", return_value=(0, "app.service enabled")), patch.object(self.m, "systemctl_show_many", return_value={"app.service": {"FragmentPath": "/etc/systemd/system/app.service"}}):
+            self.p.discover_services()
+        self.p.update_service({"unit": "app.service", "op": "follow"})
+        self.p.update_service({"unit": "app.service", "op": "favorite"})
+        self.assertIn("app.service", self.m.Panel().units())
+        self.assertIn("app.service", self.m.Panel().service_catalog()["favorites"])
+        self.p.update_service({"unit": "app.service", "op": "remove"})
+        self.assertNotIn("app.service", self.p.units())
+        self.assertIn("app.service", self.p.service_catalog()["services"])
+        with self.assertRaises(ValueError):
+            self.p.update_service({"unit": "unknown.service", "op": "follow"})
+        with self.assertRaises(ValueError):
+            self.p.update_service({"unit": "app.service", "op": "favorite"})
+
+    def test_failed_scan_retains_catalog_and_records_error(self):
+        with patch.object(self.m, "run", return_value=(1, "unavailable")):
+            self.p.discover_services()
+        self.assertIn("unavailable", self.p.service_catalog()["error"])
+
+    def test_legacy_service_can_be_followed_again(self):
+        self.p.update_service({"unit": "a.service", "op": "remove"})
+        self.p.update_service({"unit": "a.service", "op": "follow"})
+        self.assertIn("a.service", self.m.Panel().units())
+
+    def test_discovery_runs_immediately_then_every_five_minutes(self):
+        with patch.object(self.p, "discover_services") as scan, patch.object(self.m.time, "sleep", side_effect=InterruptedError) as sleep:
+            with self.assertRaises(InterruptedError):
+                self.p.service_discovery_loop()
+        scan.assert_called_once_with()
+        sleep.assert_called_once_with(300)
+
+    def test_partial_scan_does_not_mark_existing_services_missing(self):
+        self.p.services["services"]["old.service"] = {"available": True}
+        with patch.object(self.m, "run", return_value=(0, "new.service enabled")), patch.object(self.m, "systemctl_show_many", return_value={}):
+            self.p.discover_services()
+        self.assertTrue(self.p.service_catalog()["services"]["old.service"]["available"])
+        self.assertTrue(self.p.service_catalog()["error"])
+
+    def test_symlink_to_vendor_is_excluded(self):
+        vendor = os.path.join(self.tmp, "vendor.service")
+        link = os.path.join(self.tmp, "local.service")
+        with open(vendor, "w") as f:
+            f.write("[Service]\n")
+        os.symlink(vendor, link)
+        with patch.object(self.m, "run", return_value=(0, "linked.service enabled")), patch.object(self.m, "systemctl_show_many", return_value={"linked.service": {"FragmentPath": link}}):
+            self.p.discover_services()
+        self.assertNotIn("linked.service", self.p.service_catalog()["services"])
 
 
 class ParsingTests(Fixture):
@@ -458,7 +528,10 @@ class NoProviderTests(Fixture):
 
 class GovernorTests(Fixture):
     def setUp(self):
-        super().setUp()
+        # These tests seed the credit model themselves. An asynchronous startup
+        # replay can otherwise clear pending steps halfway through a test.
+        with patch.object(threading.Thread, "start"):
+            super().setUp()
         c = self.p.sampler.credits
         c.backfilling = False
         c.n, c.base, c.limit = 8.0, 4.8, 2.4
@@ -606,6 +679,14 @@ class TmuxTests(Fixture):
 
 
 class HttpTests(Fixture):
+    def test_service_preferences_require_auth_and_validate_catalog(self):
+        body = {"unit": "a.service", "op": "favorite"}
+        self.assertEqual(self.req("/api/services", body=body)[0], 401)
+        self.assertEqual(self.req("/api/services", token=self.p.token, body=body)[0], 200)
+        self.assertIn("a.service", self.p.service_catalog()["favorites"])
+        self.assertEqual(self.req("/api/services", token=self.p.token,
+                                  body={"unit": "not-discovered.service", "op": "follow"})[0], 400)
+
     def setUp(self):
         super().setUp()
         self.m.Handler.panel = self.p

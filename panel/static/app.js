@@ -683,8 +683,11 @@ $("#eo-save").addEventListener("click", () => act("/api/earlyoom", { args: $("#e
 
 function renderServices() {
   const units = status.watchdog.units || {};
+  const catalog = status.service_catalog || { services: {}, favorites: [] };
+  const favorites = new Set(catalog.favorites);
+  const followed = [...status.units].sort((a, b) => Number(favorites.has(b)) - Number(favorites.has(a)) || a.localeCompare(b));
   $("#units").innerHTML = `<tr><th>Unit</th><th>State</th><th class="num">Memory</th><th>Since</th><th></th></tr>` +
-    status.units.map((u) => {
+    followed.map((u) => {
       const s = units[u] || {};
       const lvl = s.ActiveState === "active" ? "good" : s.ActiveState === "failed" ? "critical" : "warning";
       const mem = Number(s.MemoryCurrent);
@@ -692,11 +695,16 @@ function renderServices() {
         <td><span class="dot ${lvl}"></span> ${esc(s.ActiveState || "?")} (${esc(s.SubState || "")})</td>
         <td class="num">${mem && mem < 1e18 ? fmtMB(mem / 1048576) : "–"}</td>
         <td>${esc(s.ActiveEnterTimestamp || "")}</td>
-        <td class="actions"><button class="small" data-unit="${esc(u)}" data-op="start">Start</button>
+        <td class="actions"><button class="small" data-service="${esc(u)}" data-service-op="${favorites.has(u) ? "unfavorite" : "favorite"}" aria-label="${favorites.has(u) ? "Unfavorite" : "Favorite"} ${esc(u)}" aria-pressed="${favorites.has(u)}">${favorites.has(u) ? "★" : "☆"}</button>
+          <button class="small" data-unit="${esc(u)}" data-op="start">Start</button>
           <button class="small" data-unit="${esc(u)}" data-op="restart">Restart</button>
-          <button class="small" data-unit="${esc(u)}" data-op="stop">Stop</button></td></tr>`;
-    }).join("");
-  if (document.activeElement !== $("#units-edit")) $("#units-edit").value = status.units.join(" ");
+          <button class="small" data-unit="${esc(u)}" data-op="stop">Stop</button>
+          <button class="small" data-service="${esc(u)}" data-service-op="remove">Unfollow</button></td></tr>`;
+    }).join("") + (!followed.length ? `<tr><td colspan="5" class="muted">No followed services. Choose one from the catalog below.</td></tr>` : "");
+  $("#services-scan").textContent = (catalog.last_scan ? `Last scan: ${new Date(catalog.last_scan * 1000).toLocaleString()}.` : "Waiting for the first scan.") + (catalog.error ? ` Scan failed: ${catalog.error}` : "");
+  const search = $("#services-search").value.trim().toLowerCase();
+  const available = Object.entries(catalog.services).filter(([u, s]) => !status.units.includes(u) && `${u} ${s.description}`.toLowerCase().includes(search)).sort(([a], [b]) => a.localeCompare(b));
+  $("#services-catalog").innerHTML = `<tr><th>Service</th><th>Availability</th><th></th></tr>` + (available.length ? available.map(([u, s]) => `<tr><td><b>${esc(u)}</b><br><span class="muted small">${esc(s.description)}</span></td><td>${s.available ? "Installed" : "No longer detected"}</td><td><button class="small" data-service="${esc(u)}" data-service-op="follow">Follow</button></td></tr>`).join("") : `<tr><td colspan="3" class="muted">No services to add${search ? " matching this search" : ""}.</td></tr>`);
   const h = status.host, sw = status.swap;
   $("#swap-info").textContent = `Used ${fmtMB(h.swap_used_mb)} of ${fmtMB(h.swap_total_mb)} · RAM available ${fmtMB(h.mem_avail_mb)} · disk ${sw.disk_free_gb} GB free of ${sw.disk_total_gb} GB (${sw.fstype})`;
   $("#swap-devices").innerHTML = `<tr><th>File</th><th class="num">Size</th><th class="num">Used</th><th class="num">Priority</th><th></th></tr>` +
@@ -710,7 +718,13 @@ $("#units").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-unit]");
   if (b) act("/api/action", { action: "unit", unit: b.dataset.unit, op: b.dataset.op }, b.dataset.op === "start" ? null : `${b.dataset.op} ${b.dataset.unit}?`);
 });
-$("#units-save").addEventListener("click", () => act("/api/units", { units: $("#units-edit").value }));
+function servicePreference(e) {
+  const b = e.target.closest("button[data-service]");
+  if (b) act("/api/services", { unit: b.dataset.service, op: b.dataset.serviceOp });
+}
+$("#units").addEventListener("click", servicePreference);
+$("#services-catalog").addEventListener("click", servicePreference);
+$("#services-search").addEventListener("input", () => { if (status) renderServices(); });
 $("#swap-add").addEventListener("click", () => {
   const gb = Number($("#swap-size").value);
   act("/api/action", { action: "swap_add", size_gb: gb }, `Create a ${gb} GB swap file and enable it now?`);
