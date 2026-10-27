@@ -1,0 +1,59 @@
+# cpu-watchdog panel configuration (read at start; restart the panel after edits).
+# The panel runs as root and can edit /etc/cpu-watchdog.conf, signal processes,
+# restart units and reboot the host. Keep it on loopback and reach it through
+# an SSH tunnel: ssh -L 8790:127.0.0.1:8790 <host>
+PANEL_BIND=127.0.0.1
+PANEL_PORT=8790
+
+# Bearer token required by every /api call. Generated on first start (mode 600).
+PANEL_TOKEN_FILE=/etc/cpu-watchdog-panel.token
+
+# Extra Host header values accepted besides 127.0.0.1/localhost/[::1] on PANEL_PORT
+# (DNS rebinding protection), e.g. "panel.internal:8790". Space separated.
+PANEL_ALLOWED_HOSTS=""
+
+# systemd units the panel may start/stop/restart. Also editable from the panel.
+# Services discovered every 5 minutes can be followed/unfollowed from Services.
+# Catalog and favorites persist in STATE_DIR/panel-services.json.
+# Prefix a user unit with its owner: "alice/sync.service" runs
+# systemctl --user -M alice@ (the user needs lingering: loginctl enable-linger alice).
+PANEL_UNITS="cpu-watchdog.timer earlyoom cpu-watchdog-panel"
+
+# 1 = show the reboot action (requires typing the hostname).
+PANEL_ALLOW_REBOOT=1
+
+# Sampling interval (seconds) and in-memory history length (minutes).
+PANEL_SAMPLE_SEC=3
+PANEL_HISTORY_MIN=60
+
+WATCHDOG_CONF=/etc/cpu-watchdog.conf
+WATCHDOG_CTL=/usr/local/bin/cpu-watchdog-ctl
+EARLYOOM_DEFAULT=/etc/default/earlyoom
+
+# Estimated burstable-CPU credits (token bucket); see README "Burstable CPU credits".
+# Off by default. Providers: none | hostinger | aws-t3 | custom.
+#   hostinger: baseline 60%, a full balance lasts 3 h at 100% on every vCPU,
+#              capped at 30% (40% on 1 vCPU) at zero until back to 20%.
+#   aws-t3:    standard mode; set PANEL_CREDIT_BASELINE_PCT (per vCPU baseline of
+#              the instance size, e.g. 20 for t3.small); holds 24 h of earnings,
+#              capped at the baseline at zero.
+#   custom:    BASELINE_PCT, THROTTLE_PCT and CAP_HOURS are required.
+# The provider does not expose the real balance: the panel replays recent atop
+# logs on first start, then tracks /proc/stat. Any key below overrides the preset;
+# leave it empty to use the preset. After changing them, delete
+# STATE_DIR/panel-credits.json and restart the panel to replay history.
+PANEL_CREDIT_PROVIDER=none
+PANEL_CREDIT_VCPUS=""
+PANEL_CREDIT_BASELINE_PCT=""
+# burst = CAP_HOURS x (vCPUs - baseline cores); accrual = CAP_HOURS x baseline cores
+PANEL_CREDIT_CAP_MODE=""
+PANEL_CREDIT_CAP_HOURS=""
+PANEL_CREDIT_THROTTLE_PCT=""
+PANEL_CREDIT_RECOVER_PCT=""
+# 0 = nothing is earned while usage presses the cap
+PANEL_CREDIT_EARN_WHILE_THROTTLED=""
+PANEL_ATOP_DIR=/var/log/atop
+# Minute history kept for the charts (also seeded from atop on first start).
+PANEL_HISTORY_DAYS=7
+# History replayed on first start; start it after a quiet period (full balance).
+PANEL_CREDIT_REPLAY_HOURS=168

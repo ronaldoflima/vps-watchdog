@@ -14,12 +14,14 @@ fi
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHANGED=0
 REPLACE_EARLYOOM=0
+WITH_PANEL=0
 REQUESTED_MODE=""
 for arg in "$@"; do
     case "$arg" in
         --replace-earlyoom) REPLACE_EARLYOOM=1 ;;
+        --with-panel) WITH_PANEL=1 ;;
         --mode=active|--mode=observe) REQUESTED_MODE="${arg#*=}" ;;
-        *) echo "Usage: sudo ./install.sh [--mode=active|--mode=observe] [--replace-earlyoom]" >&2; exit 2 ;;
+        *) echo "Usage: sudo ./install.sh [--mode=active|--mode=observe] [--replace-earlyoom] [--with-panel]" >&2; exit 2 ;;
     esac
 done
 INSTALL_MODE=active
@@ -189,6 +191,33 @@ if [ "$CHANGED" -eq 1 ]; then
     echo "  timer reloaded (changes detected)"
 fi
 
+PANEL_CHANGED=0
+if [ "$WITH_PANEL" -eq 1 ] || [ -f /etc/systemd/system/cpu-watchdog-panel.service ]; then
+    echo "==> Web panel (loopback only)"
+    before=$CHANGED
+    CHANGED=0
+    install_if_changed "$REPO_DIR/panel/cpu-watchdog-panel.py" /usr/local/lib/cpu-watchdog-panel/cpu-watchdog-panel.py 755
+    for f in index.html app.js app.css; do
+        install_if_changed "$REPO_DIR/panel/static/$f" "/usr/local/lib/cpu-watchdog-panel/static/$f"
+    done
+    install_if_changed "$REPO_DIR/systemd/cpu-watchdog-panel.service" /etc/systemd/system/cpu-watchdog-panel.service
+    if [ ! -f /etc/cpu-watchdog-panel.conf ]; then
+        install -D -m 600 "$REPO_DIR/config/cpu-watchdog-panel.conf.example" /etc/cpu-watchdog-panel.conf
+        echo "  created: /etc/cpu-watchdog-panel.conf"
+        CHANGED=1
+    fi
+    PANEL_CHANGED=$CHANGED
+    [ "$before" -eq 1 ] && CHANGED=1
+    if [ "$PANEL_CHANGED" -eq 1 ]; then
+        systemctl daemon-reload
+    fi
+    systemctl enable --now cpu-watchdog-panel.service
+    if [ "$PANEL_CHANGED" -eq 1 ]; then
+        systemctl restart cpu-watchdog-panel.service
+        echo "  panel restarted"
+    fi
+fi
+
 echo
 echo "==> Summary"
 (
@@ -206,6 +235,9 @@ echo "==> Summary"
     fi
     echo "  Edit:                   sudo \$EDITOR /etc/cpu-watchdog.conf   (no restart needed; the timer reads the file on every run)"
     echo "  View/manage:            sudo cpu-watchdog-ctl   (interactive menu: view throttles, release, whitelist)"
+    if [ -f /etc/systemd/system/cpu-watchdog-panel.service ]; then
+        echo "  Web panel:              ssh -L 8790:127.0.0.1:8790 <host>, then http://127.0.0.1:8790 (token: sudo cat /etc/cpu-watchdog-panel.token)"
+    fi
 )
 
 echo

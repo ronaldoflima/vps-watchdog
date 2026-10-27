@@ -317,6 +317,7 @@ existing logs retain their previous permissions. See [SECURITY.md](SECURITY.md).
 | Active throttles | `systemctl list-units 'cpu-watchdog-limit-*'` |
 | earlyoom | `/etc/default/earlyoom` (and `journalctl -u earlyoom`) |
 | tailscaled OOM protection | `/etc/systemd/system/tailscaled.service.d/oom.conf` |
+| Web panel (optional) | `/usr/local/lib/cpu-watchdog-panel/`, `/etc/cpu-watchdog-panel.conf`, `/etc/cpu-watchdog-panel.token`, `cpu-watchdog-panel.service` |
 
 ## Operations
 
@@ -377,6 +378,151 @@ systemctl stop cpu-watchdog-limit-<PID>-<starttime>.scope   # release one thrott
 # or: pkill -f "cpulimit -p <PID>"
 ```
 
+## Web panel (optional)
+
+`sudo ./install.sh --with-panel` adds a small web panel (Python standard
+library, no dependencies) for watching and steering everything above from a
+browser:
+
+- **Overview:** host CPU busy/steal, load, agent slice usage against its quota,
+  agent stall time (cgroup PSI), memory and swap, plus, when a provider is
+  configured, an **estimated CPU-credit balance** (see below). Charts cover 1 h to 7 days: the last hour
+  from 3 s samples, longer ranges from per-minute averages persisted in
+  `STATE_DIR/panel-history.json` (`PANEL_HISTORY_DAYS`); on first start CPU and
+  steal history are seeded from `atop` logs.
+- **Processes:** top CPU/memory consumers and every agent session (cwd, tty,
+  age, command line), with terminate/kill/resume and throttle release.
+- **Watchdog:** layer counters, quota state, active `cpulimit` throttles,
+  `free` for tmux targets and the log.
+- **Config:** every `/etc/cpu-watchdog.conf` setting grouped by layer, validated
+  before writing (`bash -n`, types, regexes), with a one-step backup restore;
+  earlyoom arguments (rolled back if earlyoom fails to restart).
+- **Services:** follow/unfollow services from a persistent catalog and star
+  favorites to keep them at the top; start/stop/restart followed units. Discovery
+  runs at panel startup and every 5 minutes, even with the browser closed. It
+  catalogs services whose resolved systemd fragment is in `/etc/systemd/system`
+  or `/usr/local/lib/systemd/system`, excluding distribution units (including
+  those with local drop-ins or enablement symlinks). Installed services and
+  loaded template instances are included; bare templates are excluded.
+  Previously detected services stay selectable when no longer detected.
+  Existing `PANEL_UNITS` entries (including `user/unit` specs) are preserved;
+  removing a service from the panel does not stop or disable it. Preferences and
+  the catalog are saved in `STATE_DIR/panel-services.json`; the followed list
+  remains in `PANEL_UNITS`. Discovery covers the host system manager; existing
+  user-unit entries remain manageable. Also includes swap
+  management (add or remove `swapfileN` files on the root filesystem, persisted
+  in `/etc/fstab`; set `vm.swappiness`, persisted in
+  `/etc/sysctl.d/99-zz-cpu-watchdog-panel.conf`; flush swap back to RAM) and
+  host reboot (requires typing the hostname).
+
+Any config change, quota change, watchdog pause or tmux `free` can be made
+**temporary** ("for 10 min", "for 1 h", ...). The panel records it in
+`STATE_DIR/panel-overrides.json` and reverts it when it expires, also across
+panel restarts. A key changed again in the meantime is left alone. Active
+overrides are listed at the top of every page with *+10 min*, *Revert now* and
+*Keep permanently*.
+
+### Burstable CPU credits
+
+Burstable VPS and cloud plans throttle the whole VM when it uses more than a
+baseline for too long. Most model this as a token bucket: the VM earns credits
+at its baseline rate, spends the CPU time it actually runs, and is capped when
+the balance hits zero. The provider measures this on the host and usually does
+not expose the balance to the guest, so the panel **estimates** it from the
+guest's own non-idle CPU time (`/proc/stat` user+nice+system+irq+softirq,
+steal excluded). On first start it replays the last `PANEL_CREDIT_REPLAY_HOURS`
+of `atop` logs from a full balance, then tracks live and persists the estimate
+in `STATE_DIR/panel-credits.json`. The overview then shows the balance, whether
+it is draining or refilling and how long all vCPUs can run flat out.
+
+Credits are **off by default** (`PANEL_CREDIT_PROVIDER=none`): the credits tile,
+chart and governor action are hidden. Pick a preset in
+`/etc/cpu-watchdog-panel.conf` and restart the panel:
+
+| `PANEL_CREDIT_PROVIDER` | Baseline | Capacity | At zero | Limit lifts |
+|---|---|---|---|---|
+| `none` (default) | – | – | – | – |
+| `hostinger` (KVM plans) | 60% of the vCPUs | `burst`, 3 h at 100% on every vCPU: 3 h × (vCPUs − baseline cores) | capped at 30% (40% on 1 vCPU), nothing earned while pressing the cap | at 20% of capacity |
+| `aws-t3` (T3/T3a standard mode) | **required**: `PANEL_CREDIT_BASELINE_PCT` per instance size | `accrual`, 24 h of baseline earnings | capped at the baseline | as soon as any credit accrues |
+| `custom` | `PANEL_CREDIT_BASELINE_PCT` | `PANEL_CREDIT_CAP_MODE` / `PANEL_CREDIT_CAP_HOURS` | `PANEL_CREDIT_THROTTLE_PCT` | `PANEL_CREDIT_RECOVER_PCT` (default 0) |
+
+AWS T3 baseline per vCPU: `t3.nano` 5, `t3.micro` 10, `t3.small` 20,
+`t3.medium` 20, `t3.large` 30, `t3.xlarge` 40, `t3.2xlarge` 40 (same for
+T3a). T3 instances launch in *unlimited* mode by default, where AWS bills the
+surplus instead of throttling; the preset only makes sense in standard mode.
+
+Every explicit key overrides the preset:
+
+| Key | Meaning |
+|---|---|
+| `PANEL_CREDIT_VCPUS` | vCPUs the provider bills for (default: `nproc`) |
+| `PANEL_CREDIT_BASELINE_PCT` | earn rate, % of all vCPUs |
+| `PANEL_CREDIT_CAP_MODE` | `burst`: capacity = hours × (vCPUs − baseline cores); `accrual`: capacity = hours × baseline cores |
+| `PANEL_CREDIT_CAP_HOURS` | hours for the capacity formula |
+| `PANEL_CREDIT_THROTTLE_PCT` | CPU cap at zero balance, % of all vCPUs |
+| `PANEL_CREDIT_RECOVER_PCT` | the cap lifts when the balance is back to this % of capacity |
+| `PANEL_CREDIT_EARN_WHILE_THROTTLED` | `0` = nothing is earned while usage presses the cap (≥ 90% of it) |
+
+Older configs keep working: `PANEL_CREDIT_MODEL=1` without a provider means
+`hostinger`, and `PANEL_CREDIT_BURST_HOURS` is read as `PANEL_CREDIT_CAP_HOURS`
+with `burst` mode. An incomplete or invalid configuration disables the estimate
+and the overview says why.
+
+**Calibrating.** The numbers are estimates: the provider meters the host side
+(including hypervisor overhead the guest does not see) and plans drift from
+the documentation. When the provider confirms a throttling event (support
+ticket, console graph, or a sudden flat ceiling in the CPU chart with steal
+rising), fit the model to it:
+
+1. Note when the cap started and the cap level (e.g. busy flat at 50% of the
+   vCPUs); set `PANEL_CREDIT_THROTTLE_PCT` to that level.
+2. Make sure `PANEL_CREDIT_REPLAY_HOURS` covers the event plus a quiet period
+   before it (the replay assumes a full balance at its start).
+3. Adjust `PANEL_CREDIT_BASELINE_PCT` and `PANEL_CREDIT_CAP_HOURS`, delete
+   `STATE_DIR/panel-credits.json` and restart the panel to replay history.
+4. Repeat until the replayed balance reaches zero at the time the cap started
+   (and the limit lifts when the provider lifted it). A lower baseline drains
+   faster during long busy stretches; a smaller capacity shortens short bursts.
+
+### Credit governor
+
+With `CREDIT_GOVERNOR=1` (Config tab, or *Credit governor → Turn on* in the
+overview, also temporarily) the panel turns the estimate into policy. Every
+30 s it computes how much CPU the balance can sustain,
+`baseline + (balance - reserve) / CREDIT_HORIZON_MIN`, between the provider's
+cap and all vCPUs, where the reserve is `CREDIT_GOV_RESERVE_PCT` of the
+capacity (default 20). The balance therefore settles at the reserve instead of
+near zero, a margin for estimation error; below it, usage is held under the
+baseline until the balance recovers. It sets
+the agent slice quota to that minus what other processes use, leaving the
+agents uncapped while the balance can sustain every vCPU and never going
+below `CREDIT_GOV_MIN_QUOTA_PCT`. It publishes the allowance in
+`STATE_DIR/credit-governor`, and the watchdog then triggers Layer 2 on that
+allowance instead of the fixed `AGG_CPU_THRESHOLD_PCT` and leaves the quota
+to the panel. The effect is to use the whole VM while credits last and to
+slow down gradually as they approach the reserve, settling at the baseline
+instead of hitting the provider's cap. If the panel stops, the file goes stale and the
+watchdog restores the fixed policy within 3 minutes. Manual quota changes
+are refused while the governor is on. The governor needs a credit provider:
+with `PANEL_CREDIT_PROVIDER=none` the panel refuses to turn it on and the loop
+does nothing.
+
+The panel runs as root, so it listens on `127.0.0.1:8790` only and every API
+call needs the bearer token from `/etc/cpu-watchdog-panel.token` (created on
+first start, mode 600). It also rejects unexpected `Host` headers (DNS
+rebinding) and non-JSON posts. Open it through an SSH tunnel:
+
+```bash
+ssh -L 8790:127.0.0.1:8790 <host>
+# then http://127.0.0.1:8790 and paste the token, or open
+# http://127.0.0.1:8790/#token=<token> (the fragment is never sent to the server)
+```
+
+Every change made from the panel is written to the watchdog log as a
+`PANEL ...` line. Settings live in `/etc/cpu-watchdog-panel.conf` (see
+`config/cpu-watchdog-panel.conf.example`); restart `cpu-watchdog-panel` after
+editing it.
+
 ## Rollback
 
 **Restore an earlier version** (preserves the installed watchdog configuration):
@@ -403,6 +549,8 @@ sudo rm /usr/local/bin/cpu-watchdog.sh /usr/local/bin/cpu-watchdog-ctl
 sudo rm -r /var/lib/cpu-watchdog /run/cpu-watchdog.lock
 sudo cp /etc/cpu-watchdog.conf ~/cpu-watchdog.conf.bak && sudo rm /etc/cpu-watchdog.conf  # contains the token
 sudo rm /etc/systemd/system/tailscaled.service.d/oom.conf   # if present
+sudo systemctl disable --now cpu-watchdog-panel.service 2>/dev/null   # if the panel was installed
+sudo rm -rf /etc/systemd/system/cpu-watchdog-panel.service /usr/local/lib/cpu-watchdog-panel /etc/cpu-watchdog-panel.conf /etc/cpu-watchdog-panel.token
 sudo systemctl daemon-reload
 # earlyoom: disable it, remove the package, or restore your /etc/default/earlyoom
 sudo systemctl disable --now earlyoom
@@ -418,7 +566,7 @@ messages, commit messages, issues and pull requests. See [CONTRIBUTING.md](CONTR
 
 ```bash
 tests/lint.sh   # bash -n, shellcheck, systemd-analyze verify
-tests/run.sh    # layer, sanitization, notification, configuration and installer tests
+tests/run.sh    # layer, sanitization, notification, configuration, installer and panel tests
 ```
 
 Tests require the runtime tools listed above, including `diffutils` for installer
